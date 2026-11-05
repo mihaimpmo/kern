@@ -109,7 +109,9 @@ extern "C" fn kmain() -> ! {
         kprintln!("\x1b[93m[warn]\x1b[0m no PS/2 keyboard found (USB keyboards are not supported yet)");
     }
 
+    find_disks();
     fs::init();
+    mount_disks();
     let mut unpacked = 0;
     for module in boot::MODULES.response().into_iter().flat_map(|r| r.modules()) {
         if module.path().ends_with(".tar") {
@@ -137,6 +139,47 @@ extern "C" fn kmain() -> ! {
 
     // This boot thread becomes the idle task.
     task::idle();
+}
+
+/// Scan PCI and set up every NVMe SSD as a block device.
+fn find_disks() {
+    use drivers::{block, nvme, pci};
+    let functions = pci::enumerate();
+    ok(format_args!("PCI: {} function(s)", functions.len()));
+    for f in functions.iter().filter(|f| (f.class, f.subclass, f.prog_if) == (0x01, 0x08, 0x02)) {
+        match nvme::probe(f) {
+            Ok(disk) => {
+                let name = block::BlockDevice::name(&*disk);
+                ok(format_args!("{}: NVMe {:04x}:{:04x}, {} MiB", name, f.vendor, f.device_id, disk_mib(&*disk)));
+                block::register(disk);
+            }
+            Err(why) => kprintln!("\x1b[93m[warn]\x1b[0m NVMe at {:02x}:{:02x}.{}: {}", f.bus, f.device, f.function, why),
+        }
+    }
+}
+
+/// Mount every disk that holds a Kern filesystem: /disk, /disk1, ... Other
+/// disks are left alone (nothing is ever written to them).
+fn mount_disks() {
+    let mut mounted = 0;
+    for disk in drivers::block::devices() {
+        let name = alloc::string::String::from(disk.name());
+        match fs::kfs::mount(disk) {
+            Ok(root) => {
+                let at = if mounted == 0 { alloc::format!("disk") } else { alloc::format!("disk{}", mounted) };
+                match fs::mount(&at, root) {
+                    Ok(()) => ok(format_args!("{}: Kern filesystem mounted at /{}", name, at)),
+                    Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m {}: cannot mount at /{}: {:?}", name, at, e),
+                }
+                mounted += 1;
+            }
+            Err(why) => kprintln!("\x1b[93m[warn]\x1b[0m {}: {}; left untouched", name, why),
+        }
+    }
+}
+
+fn disk_mib(disk: &dyn drivers::block::BlockDevice) -> u64 {
+    disk.block_count() * drivers::block::BLOCK_SIZE as u64 >> 20
 }
 
 fn ok(msg: impl core::fmt::Display) {

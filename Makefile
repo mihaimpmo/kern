@@ -2,9 +2,11 @@
 # Optional: qemu-system-x86_64 and OVMF to test without real hardware.
 
 LIMINE_VERSION := v11.4.1-binary
-PROGRAMS       := init hello spin crash selftest ls cat mkdir rm echo ps sleep kill date wc
+PROGRAMS       := init hello spin crash selftest ls cat mkdir rm echo ps sleep kill date wc mv df
 ISO            := kern.iso
 TEST_ISO       := kern-test.iso
+DISK           := disk.img
+DISK_MIB       := 64
 # Boot entry tweaks for the test ISO: no menu delay, selftest as pid 1, and
 # QEMU exits with its result.
 TEST_CMDLINE   := init=selftest qemu-exit
@@ -64,13 +66,20 @@ $(TEST_ISO): kernel user limine/limine limine.conf
 test: $(ISO) $(TEST_ISO)
 	python3 tests/run.py $(ISO) $(TEST_ISO)
 
+# The disk `make run` attaches as an NVMe SSD, mounted at /disk. Created once
+# and then kept: it holds your files. Delete it to start over.
+$(DISK):
+	python3 tools/kfs.py mkfs $(DISK) $(DISK_MIB)
+
+QEMU_DISK := -drive file=$(DISK),format=raw,if=none,id=disk -device nvme,serial=kern,drive=disk
+
 # Legacy BIOS boot in QEMU
-run: $(ISO)
-	qemu-system-x86_64 -M q35 -m 512M -cdrom $(ISO) -serial stdio
+run: $(ISO) $(DISK)
+	qemu-system-x86_64 -M q35 -m 512M -smp 4 -cdrom $(ISO) $(QEMU_DISK) -serial stdio
 
 # UEFI boot in QEMU (closer to modern laptops)
-run-uefi: $(ISO)
-	qemu-system-x86_64 -M q35 -m 512M -bios $(OVMF) -cdrom $(ISO) -serial stdio
+run-uefi: $(ISO) $(DISK)
+	qemu-system-x86_64 -M q35 -m 512M -smp 4 -bios $(OVMF) -cdrom $(ISO) $(QEMU_DISK) -serial stdio
 
 clean:
 	rm -rf iso_root build $(ISO) $(TEST_ISO)

@@ -10,7 +10,10 @@ A small monolithic x86-64 kernel written in Rust. It boots on real PCs (UEFI or 
 [ ok ] scheduler and system calls ready
 [ ok ] 4 CPU(s) online
 [ ok ] PS/2 keyboard
-[ ok ] filesystem: 9 file(s) from the initramfs
+[ ok ] PCI: 7 function(s)
+[ ok ] nvme0n1: NVMe 1b36:0010, 64 MiB
+[ ok ] filesystem: 17 file(s) from the initramfs
+[ ok ] nvme0n1: Kern filesystem mounted at /disk
 [ ok ] started init (pid 1)
 
 kern:/> hello &
@@ -39,9 +42,10 @@ kern:/> ls /bin | wc -l
 | Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret`, arguments (argv) |
 | Floating point | SSE in user programs, register state saved per task |
-| Files | In-memory VFS (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection |
+| Files | VFS with an in-memory root (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection, rename |
+| Storage | PCI enumeration, NVMe driver, write-through block cache; **KFS**, Kern's own on-disk filesystem, mounted at `/disk` |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
-| Syscalls | 33: processes (spawn with argv, wait, kill, process groups), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, chdir, dup2, pipe, ...), time |
+| Syscalls | 35: processes (spawn with argv, wait, kill, process groups), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, rename, chdir, dup2, pipe, statfs, ...), time |
 | Signals | `kill`, process groups, Ctrl+C interrupts the foreground job; CPU faults kill with SIGSEGV/SIGILL/SIGFPE |
 | Pipes | 64 KiB pipes with EOF and EPIPE, close-on-spawn descriptors |
 | Clock | Date and time from the CMOS real-time clock |
@@ -63,21 +67,22 @@ kern/
 │       ├── console.rs  framebuffer + serial console, kprintln!
 │       ├── acpi.rs     finds the MADT (CPUs, interrupt controllers)
 │       ├── syscall/    syscall entry (assembly), dispatch, file/process/memory calls
-│       ├── fs/         VFS, tmpfs, devices, initramfs
+│       ├── fs/         VFS, tmpfs, KFS (on disk), pipes, devices, initramfs
 │       ├── sync.rs     SpinLock, IrqGuard
 │       ├── arch/       cpu, gdt, idt, interrupts, apic, percpu, smp
 │       ├── mm/         pmm (frames), vmm (page tables), uspace (process memory), heap, kstack
 │       ├── task/       scheduler, context switch, ELF loader
-│       └── drivers/    keyboard, serial
+│       └── drivers/    keyboard, serial, rtc, pci, nvme, block (cache)
 ├── user/
 │   ├── linker.ld       user programs start at 0x400000
 │   ├── ulib/           syscalls, print!/println!, args, heap allocator, _start, panic handler
 │   ├── init/           the shell
-│   ├── ls/ cat/ wc/ ...   utilities: ls cat echo wc mkdir rm ps kill sleep date
+│   ├── ls/ cat/ wc/ ...   utilities: ls cat echo wc mkdir rm mv df ps kill sleep date
 │   ├── hello/          prints with pauses (run several with `hello &`)
 │   ├── spin/           hogs the CPU to show preemption
 │   ├── crash/          writes to kernel memory to show protection
 │   └── selftest/       kernel checks run by `make test`
+├── tools/kfs.py        KFS disk images: mkfs, check, ls, cat, put
 └── tests/run.py        boots the test ISOs in QEMU and checks the results
 ```
 
@@ -98,12 +103,26 @@ Then:
 
 ```sh
 make            # -> kern.iso
-make run        # test in QEMU, legacy BIOS
+make run        # test in QEMU, legacy BIOS (with disk.img as an NVMe SSD at /disk)
 make run-uefi   # test in QEMU, UEFI
 make test       # automated tests in QEMU (needs python3)
 ```
 
 The Makefile sets `RUSTC_BOOTSTRAP=1` so a stable Rust toolchain can rebuild `core`/`alloc` for the bare-metal targets. With a nightly toolchain that variable is unnecessary. The kernel is built for `x86_64-unknown-none`; user programs for `user/x86_64-kern-user.json`, the same target with SSE floating point enabled.
+
+## The disk
+
+`make run` attaches `disk.img` (created on first use, 64 MiB) as an NVMe SSD; Kern mounts it at `/disk`, and whatever you put there survives a reboot. Delete `disk.img` to start over. `tools/kfs.py` works with images from the host:
+
+```sh
+python3 tools/kfs.py mkfs my.img 128        # a new 128 MiB disk
+python3 tools/kfs.py put my.img notes.txt /notes.txt
+python3 tools/kfs.py ls my.img /
+python3 tools/kfs.py cat my.img /notes.txt
+python3 tools/kfs.py check my.img           # verify the whole structure
+```
+
+KFS uses 4 KiB blocks, a superblock, inode and block bitmaps, 128-byte inodes (12 direct, one indirect and one double-indirect block pointer: files up to ~4 GiB) and directories of 256-byte entries (names up to 248 bytes). The full format is in the header of `tools/kfs.py`. Every write reaches the disk before the call returns; there is no journal yet, so a crash in the middle of an operation can leak blocks, which `kfs.py check` reports.
 
 ## Booting on a real computer
 
@@ -113,7 +132,7 @@ The Makefile sets `RUSTC_BOOTSTRAP=1` so a stable Rust toolchain can rebuild `co
 2. In the firmware setup, **turn off Secure Boot**. Limine isn't signed with Microsoft's key.
 3. Boot from the USB stick. On Lenovo IdeaPads: press **F12** at power-on, or use the **Novo** button, then choose the USB drive.
 
-Nothing is written to the internal disk; the kernel has no disk driver yet.
+Nothing is written to the internal disk. The kernel does drive NVMe SSDs, but it only mounts (and writes to) a disk that already holds a Kern filesystem, recognised by the magic in its first block. It never formats anything, so a disk with Windows or Linux on it is left alone.
 
 ### What to expect on real hardware
 
@@ -137,7 +156,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
-3. **Storage:** an NVMe or AHCI driver and a FAT32 filesystem under the VFS, so files survive a reboot.
+3. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.
 4. **`exec`, signal handlers, threads**, then a real libc port.
 5. **USB:** xHCI + HID keyboard.
 6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).

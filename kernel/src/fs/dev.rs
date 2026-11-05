@@ -2,11 +2,16 @@
 
 use super::{FsError, Inode, Kind, Result};
 use crate::drivers::{keyboard, serial};
+use core::any::Any;
 
 /// The keyboard (reading) and screen + serial port (writing).
 pub struct Console;
 
 impl Inode for Console {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> Kind {
         Kind::Device
     }
@@ -31,6 +36,10 @@ impl Inode for Console {
 pub struct Null;
 
 impl Inode for Null {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> Kind {
         Kind::Device
     }

@@ -11,6 +11,7 @@ use super::{FsError, Inode, Kind, Result};
 use crate::sync::SpinLock;
 use crate::task::WaitQueue;
 use alloc::{collections::VecDeque, sync::Arc};
+use core::any::Any;
 
 const CAPACITY: usize = 64 * 1024;
 
@@ -41,6 +42,10 @@ pub fn new() -> (Arc<ReadEnd>, Arc<WriteEnd>) {
 }
 
 impl Inode for ReadEnd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> Kind {
         Kind::Pipe
     }
@@ -69,6 +74,10 @@ impl Inode for ReadEnd {
 }
 
 impl Inode for WriteEnd {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> Kind {
         Kind::Pipe
     }

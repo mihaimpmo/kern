@@ -4,3 +4,4 @@ limine/
 *.iso
 build/
 __pycache__/
+*.img

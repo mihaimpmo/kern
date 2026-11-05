@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod fs;
 pub mod heap;
+pub mod time;
 
 use core::arch::{asm, global_asm};
 use core::fmt;
@@ -51,6 +52,8 @@ pub mod sys {
     pub const SETPGID: u64 = 31;
     pub const SET_FOREGROUND: u64 = 32;
     pub const TIME_MS: u64 = 33;
+    pub const RENAME: u64 = 34;
+    pub const STATFS: u64 = 35;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -85,6 +88,7 @@ impl Errno {
     pub const ENOENT: Errno = Errno(2);
     pub const ESRCH: Errno = Errno(3);
     pub const EINTR: Errno = Errno(4);
+    pub const EIO: Errno = Errno(5);
     pub const E2BIG: Errno = Errno(7);
     pub const ENOEXEC: Errno = Errno(8);
     pub const EBADF: Errno = Errno(9);
@@ -92,10 +96,12 @@ impl Errno {
     pub const ENOMEM: Errno = Errno(12);
     pub const EFAULT: Errno = Errno(14);
     pub const EEXIST: Errno = Errno(17);
+    pub const EXDEV: Errno = Errno(18);
     pub const ENOTDIR: Errno = Errno(20);
     pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);
     pub const EMFILE: Errno = Errno(24);
+    pub const ENOSPC: Errno = Errno(28);
     pub const EPIPE: Errno = Errno(32);
     pub const ERANGE: Errno = Errno(34);
     pub const ENAMETOOLONG: Errno = Errno(36);
@@ -108,6 +114,7 @@ impl Errno {
             2 => "no such file or directory",
             3 => "no such process",
             4 => "interrupted",
+            5 => "input/output error",
             7 => "argument list too long",
             8 => "not an executable",
             9 => "bad file descriptor",
@@ -115,10 +122,12 @@ impl Errno {
             12 => "out of memory",
             14 => "bad address",
             17 => "already exists",
+            18 => "can't move between filesystems",
             20 => "not a directory",
             21 => "is a directory",
             22 => "invalid argument",
             24 => "too many open files",
+            28 => "no space left on the disk",
             32 => "broken pipe",
             34 => "buffer too small",
             36 => "name too long",

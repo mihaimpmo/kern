@@ -97,11 +97,13 @@ fn kind_code(kind: Kind) -> u8 {
     }
 }
 
-/// `struct Stat { kind: u64 (1 file, 2 directory, 3 device, 4 pipe), size: u64 }`
+/// `struct Stat { kind: u64 (1 file, 2 directory, 3 device, 4 pipe),
+/// size: u64, mtime: u64 (Unix seconds, 0 if unknown) }`
 fn put_stat(inode: &Arc<dyn fs::Inode>, ptr: u64) -> SysResult {
-    let mut out = [0u8; 16];
+    let mut out = [0u8; 24];
     out[..8].copy_from_slice(&(kind_code(inode.kind()) as u64).to_le_bytes());
-    out[8..].copy_from_slice(&inode.size().to_le_bytes());
+    out[8..16].copy_from_slice(&inode.size().to_le_bytes());
+    out[16..].copy_from_slice(&inode.mtime().to_le_bytes());
     copy_to_user(ptr, &out)?;
     Ok(0)
 }
@@ -219,5 +221,29 @@ pub fn pipe(fds: u64, flags: u64) -> SysResult {
     out[..8].copy_from_slice(&r.to_le_bytes());
     out[8..].copy_from_slice(&w.to_le_bytes());
     copy_to_user(fds, &out)?;
+    Ok(0)
+}
+
+pub fn rename(old: u64, old_len: u64, new: u64, new_len: u64) -> SysResult {
+    let (old, new) = (user_path(old, old_len)?, user_path(new, new_len)?);
+    fs::rename(&cwd()?, &old, &new)?;
+    Ok(0)
+}
+
+/// `[block_size, total_blocks, free_blocks, total_inodes, free_inodes]` of
+/// the filesystem `path` is on (devices and pipes report the root's).
+pub fn statfs(path: u64, len: u64, ptr: u64) -> SysResult {
+    let path = user_path(path, len)?;
+    let inode = fs::lookup(&cwd()?, &path)?;
+    let stats = match inode.fs_stats() {
+        Some(stats) => stats,
+        None => fs::lookup("/", "/")?.fs_stats().ok_or(EINVAL)?,
+    };
+    let fields = [stats.block_size, stats.total_blocks, stats.free_blocks, stats.total_inodes, stats.free_inodes];
+    let mut out = [0u8; 40];
+    for (i, v) in fields.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    copy_to_user(ptr, &out)?;
     Ok(0)
 }

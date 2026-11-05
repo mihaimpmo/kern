@@ -20,6 +20,7 @@
 //!   17 open(path, len, flags) -> fd       18 close(fd)
 //!   19 lseek(fd, offset, whence) -> offset
 //!   20 stat(path, len, *Stat)             21 fstat(fd, *Stat)
+//!   34 rename(old, old_len, new, new_len) 35 statfs(path, len, *[u64; 5])
 //!   22 readdir(fd, buf, len) -> bytes     (kind byte + name; 0 at the end)
 //!   23 mkdir(path, len)                   24 unlink(path, len)
 //!   25 chdir(path, len)                   26 getcwd(buf, len) -> bytes
@@ -67,6 +68,7 @@ pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
 pub const ESRCH: Errno = Errno(3);
 pub const EINTR: Errno = Errno(4);
+pub const EIO: Errno = Errno(5);
 pub const E2BIG: Errno = Errno(7);
 pub const ENOEXEC: Errno = Errno(8);
 pub const EBADF: Errno = Errno(9);
@@ -74,12 +76,14 @@ pub const ECHILD: Errno = Errno(10);
 pub const ENOMEM: Errno = Errno(12);
 pub const EFAULT: Errno = Errno(14);
 pub const EEXIST: Errno = Errno(17);
+pub const EXDEV: Errno = Errno(18);
 pub const ENOTDIR: Errno = Errno(20);
 pub const EPIPE: Errno = Errno(32);
 pub const ERANGE: Errno = Errno(34);
 pub const EISDIR: Errno = Errno(21);
 pub const EINVAL: Errno = Errno(22);
 pub const EMFILE: Errno = Errno(24);
+pub const ENOSPC: Errno = Errno(28);
 pub const ENAMETOOLONG: Errno = Errno(36);
 pub const ENOSYS: Errno = Errno(38);
 pub const ENOTEMPTY: Errno = Errno(39);
@@ -99,6 +103,9 @@ impl From<FsError> for Errno {
             FsError::NoMemory => ENOMEM,
             FsError::Interrupted => EINTR,
             FsError::BrokenPipe => EPIPE,
+            FsError::NoSpace => ENOSPC,
+            FsError::Io => EIO,
+            FsError::CrossDevice => EXDEV,
         }
     }
 }
@@ -259,6 +266,8 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         31 => process::setpgid(a0, a1),
         32 => process::set_foreground(a0),
         33 => process::time_ms(),
+        34 => file::rename(a0, a1, a2, a3),
+        35 => file::statfs(a0, a1, a2),
         _ => Err(ENOSYS),
     };
     f.rax = match result {

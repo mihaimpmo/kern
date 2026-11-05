@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "df"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
 name = "echo"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +73,13 @@ dependencies = [
 
 [[package]]
 name = "mkdir"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "mv"
 version = "0.1.0"
 dependencies = [
  "ulib",

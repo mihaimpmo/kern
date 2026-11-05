@@ -11,10 +11,12 @@
 
 pub mod dev;
 pub mod initramfs;
+pub mod kfs;
 pub mod pipe;
 pub mod tmpfs;
 
 use crate::sync::{Mutex, SpinLock};
+use core::any::Any;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +43,12 @@ pub enum FsError {
     Interrupted,
     /// Writing to a pipe nobody reads.
     BrokenPipe,
+    /// The filesystem is full.
+    NoSpace,
+    /// The disk failed.
+    Io,
+    /// `rename` between two filesystems.
+    CrossDevice,
 }
 
 pub type Result<T> = core::result::Result<T, FsError>;
@@ -48,10 +56,40 @@ pub type Result<T> = core::result::Result<T, FsError>;
 pub const MAX_NAME: usize = 255;
 pub const MAX_PATH: usize = 4096;
 
+/// Sizes and usage of a filesystem, for `statfs`.
+#[derive(Clone, Copy, Debug)]
+pub struct FsStats {
+    pub block_size: u64,
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub total_inodes: u64,
+    pub free_inodes: u64,
+}
+
 /// A file, directory or device. Directory operations default to NotDir and
 /// data operations to IsDir, so each kind implements only its own.
-pub trait Inode: Send + Sync {
+pub trait Inode: Any + Send + Sync {
     fn kind(&self) -> Kind;
+
+    /// For telling filesystems apart (`rename` across them is CrossDevice).
+    fn as_any(&self) -> &dyn Any;
+
+    /// Last modification, in Unix seconds (0 if unknown).
+    fn mtime(&self) -> u64 {
+        0
+    }
+
+    /// The filesystem this inode lives on; None for devices and pipes.
+    fn fs_stats(&self) -> Option<FsStats> {
+        None
+    }
+
+    /// Move entry `old` of this directory to `new` in `new_dir`, replacing
+    /// a file (or empty directory) already there. Both must be on the same
+    /// filesystem.
+    fn rename(&self, _old: &str, _new_dir: &Arc<dyn Inode>, _new: &str) -> Result<()> {
+        Err(FsError::NotDir)
+    }
 
     fn size(&self) -> u64 {
         0
@@ -95,7 +133,8 @@ pub trait Inode: Send + Sync {
     }
 }
 
-static ROOT: SpinLock<Option<Arc<dyn Inode>>> = SpinLock::new(None);
+/// The root directory (tmpfs). Disks are attached to it as subdirectories.
+static ROOT: SpinLock<Option<Arc<tmpfs::Dir>>> = SpinLock::new(None);
 
 /// Create the root filesystem with /dev and /tmp.
 pub fn init() {
@@ -110,6 +149,12 @@ pub fn init() {
 
 fn root() -> Arc<dyn Inode> {
     ROOT.lock().clone().expect("filesystem not initialised")
+}
+
+/// Make `fs_root` (another filesystem's root directory) appear as `/name`.
+pub fn mount(name: &str, fs_root: Arc<dyn Inode>) -> Result<()> {
+    let root = ROOT.lock().clone().expect("filesystem not initialised");
+    root.attach(name, fs_root)
 }
 
 // ---------------------------------------------------------------- paths
@@ -181,6 +226,34 @@ pub fn mkdir(cwd: &str, path: &str) -> Result<()> {
 pub fn unlink(cwd: &str, path: &str) -> Result<()> {
     let (dir, name) = parent_of(cwd, path)?;
     dir.unlink(&name)
+}
+
+/// Move `old` to `new` (both resolved against `cwd`), replacing a file or
+/// empty directory at `new`.
+pub fn rename(cwd: &str, old: &str, new: &str) -> Result<()> {
+    let (old_full, new_full) = (canonical(cwd, old)?, canonical(cwd, new)?);
+    if old_full == new_full {
+        return lookup("/", &old_full).map(|_| ());
+    }
+    // A directory can't move inside itself.
+    if new_full.starts_with(&old_full) && new_full.as_bytes().get(old_full.len()) == Some(&b'/') {
+        return Err(FsError::Invalid);
+    }
+    let (old_dir, old_name) = parent_of("/", &old_full)?;
+    let (new_dir, new_name) = parent_of("/", &new_full)?;
+    old_dir.rename(&old_name, &new_dir, &new_name)
+}
+
+/// Check that `replacing` (an existing entry at a rename's target) may be
+/// replaced by something of kind `moving`.
+pub fn check_replace(moving: Kind, replacing: &Arc<dyn Inode>) -> Result<()> {
+    match (moving, replacing.kind()) {
+        (Kind::Dir, Kind::Dir) if !replacing.is_empty() => Err(FsError::NotEmpty),
+        (Kind::Dir, Kind::Dir) => Ok(()),
+        (Kind::Dir, _) => Err(FsError::NotDir),
+        (_, Kind::Dir) => Err(FsError::IsDir),
+        _ => Ok(()),
+    }
 }
 
 /// Create the file `path` (its directory must exist) and fill it.

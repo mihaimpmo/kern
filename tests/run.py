@@ -20,8 +20,11 @@ import tempfile
 import time
 
 QEMU = ["qemu-system-x86_64", "-M", "q35", "-m", "512M", "-display", "none", "-no-reboot"]
-# (CPU model, CPU count). max has SMEP/SMAP/UMIP, qemu64 has none.
-CONFIGS = [("qemu64", 1), ("max", 4), ("qemu64", 4)]
+# (CPU model, CPU count, with a disk). max has SMEP/SMAP/UMIP, qemu64 has
+# none. One run has no disk, to cover booting without one.
+CONFIGS = [("qemu64", 1, False), ("max", 4, True), ("qemu64", 4, True)]
+DISK_MIB = 32
+KFS_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "kfs.py")
 BOOT_TIMEOUT = 60
 STEP_TIMEOUT = 15
 
@@ -40,17 +43,42 @@ def read_log(path):
         return ""
 
 
-def machine(cpu, smp):
-    """QEMU options for a CPU model and count; several vCPUs run on several
-    host threads, so they really run in parallel."""
-    return ["-cpu", cpu, "-smp", str(smp)] + (["-accel", "tcg,thread=multi"] if smp > 1 else [])
+def machine(cpu, smp, disk=None):
+    """QEMU options for a CPU model and count, and an NVMe disk image; several
+    vCPUs run on several host threads, so they really run in parallel."""
+    opts = ["-cpu", cpu, "-smp", str(smp)] + (["-accel", "tcg,thread=multi"] if smp > 1 else [])
+    if disk:
+        opts += ["-drive", f"file={disk},format=raw,if=none,id=disk", "-device", "nvme,serial=kern,drive=disk"]
+    return opts
 
 
-def run_selftest(iso, cpu, smp, workdir):
-    name = f"{cpu} x{smp}"
-    log = os.path.join(workdir, f"selftest-{cpu}-{smp}.log")
-    cmd = QEMU + machine(cpu, smp) + ["-cdrom", iso, "-serial", f"file:{log}",
-                                      "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+def kfs(*args):
+    return subprocess.run([sys.executable, "-I", KFS_TOOL, *args], capture_output=True, text=True)
+
+
+def make_disk(workdir, name):
+    path = os.path.join(workdir, name)
+    result = kfs("mkfs", path, str(DISK_MIB))
+    if result.returncode != 0:
+        sys.exit(f"cannot create a test disk: {result.stderr}")
+    return path
+
+
+def check_disk(path, name):
+    """The kernel's writes must leave a consistent filesystem."""
+    result = kfs("check", path)
+    if result.returncode != 0:
+        print(f"  {name}: the disk image is inconsistent:")
+        print(indent(result.stdout + result.stderr))
+        return False
+    return True
+
+
+def run_selftest(iso, cpu, smp, workdir, disk=None, tag=""):
+    name = f"{cpu} x{smp}" + (" + disk" if disk else "") + tag
+    log = os.path.join(workdir, f"selftest-{cpu}-{smp}{tag.strip()}.log")
+    cmd = QEMU + machine(cpu, smp, disk) + ["-cdrom", iso, "-serial", f"file:{log}",
+                                            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
     try:
         status = subprocess.run(cmd, stdin=subprocess.DEVNULL, timeout=BOOT_TIMEOUT).returncode
     except subprocess.TimeoutExpired:
@@ -69,7 +97,22 @@ def run_selftest(iso, cpu, smp, workdir):
         print(f"  selftest on {name}: FAILED ({why})")
         failures = [l for l in text.splitlines() if l.startswith("not ok") or "PANIC" in l]
         print("\n".join("    " + l for l in failures) or indent(text))
-    return passed
+    if disk and not check_disk(disk, name):
+        passed = False
+    return passed, text
+
+
+def run_persistence(iso, workdir):
+    """Two boots on one disk: the second must see what the first wrote."""
+    disk = make_disk(workdir, "persist.img")
+    first, _ = run_selftest(iso, "qemu64", 1, workdir, disk, " (boot 1)")
+    second, text = run_selftest(iso, "qemu64", 1, workdir, disk, " (boot 2)")
+    remembered = "# disk has seen 1 earlier boot(s)" in text
+    if not remembered:
+        print("  persistence: FAILED (the second boot didn't see the first one's file)")
+    else:
+        print("  persistence: the second boot sees the first boot's data")
+    return first and second and remembered
 
 
 # ---------------------------------------------------------------- shell test
@@ -109,7 +152,7 @@ SHELL_STEPS = [
     ("cat note", r"cat: note: no such file or directory"),
     ("cd nowhere", r"cd: nowhere: no such file or directory"),
     ("echo piped words | cat", r"^piped words$"),
-    ("ls /bin | wc -l", r"^15$"),
+    ("ls /bin | wc -l", r"^17$"),
     ("echo a b c | cat | wc -w", r"^3$"),
     ("date", r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$"),
     # Ctrl+C interrupts the foreground job (once it has started: a key
@@ -125,6 +168,13 @@ SHELL_STEPS = [
     (PAUSE, None),
     ("<ctrl-c>", r"^\^C$"),                 # every process in the pipeline
     ("ps | wc -l", r"^4$"),                  # header, init, ps, wc: nothing left over
+    # The disk.
+    ("echo kept on disk > /disk/note", PROMPT),
+    ("cat /disk/note", r"^kept on disk$"),
+    ("mv /disk/note /disk/renamed", PROMPT),
+    ("ls -l /disk", r"^\s+13  \d{4}-\d\d-\d\d \d\d:\d\d:\d\d  renamed$"),
+    ("df", r"^/disk\s+\d+\s+\d+\s+\d+\s+\d+%\s+\d+$"),
+    ("mv /disk/renamed /tmp", r"can't move between filesystems"),
 ]
 
 
@@ -157,7 +207,8 @@ def wait_for(log, pattern, at_least, timeout):
 
 def run_shell(iso, workdir):
     log = os.path.join(workdir, "shell.log")
-    cmd = QEMU + machine("max", 2) + ["-cdrom", iso, "-serial", f"file:{log}", "-monitor", "stdio"]
+    disk = make_disk(workdir, "shell.img")
+    cmd = QEMU + machine("max", 2, disk) + ["-cdrom", iso, "-serial", f"file:{log}", "-monitor", "stdio"]
     qemu = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
 
     def monitor(line):
@@ -205,7 +256,11 @@ def main():
         sys.exit(__doc__)
     kern_iso, test_iso = sys.argv[1:]
     with tempfile.TemporaryDirectory(prefix="kern-test-") as workdir:
-        results = [run_selftest(test_iso, cpu, smp, workdir) for cpu, smp in CONFIGS]
+        results = []
+        for cpu, smp, with_disk in CONFIGS:
+            disk = make_disk(workdir, f"{cpu}-{smp}.img") if with_disk else None
+            results.append(run_selftest(test_iso, cpu, smp, workdir, disk)[0])
+        results.append(run_persistence(test_iso, workdir))
         results.append(run_shell(kern_iso, workdir))
     if all(results):
         print("all tests passed")

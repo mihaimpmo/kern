@@ -81,19 +81,52 @@ pub struct Stat {
     pub kind: Kind,
     /// Bytes in a file, entries in a directory.
     pub size: u64,
+    /// Last modification, Unix seconds (0 if unknown).
+    pub mtime: u64,
+}
+
+fn stat_from(raw: [u64; 3]) -> Stat {
+    Stat { kind: kind_from(raw[0]), size: raw[1], mtime: raw[2] }
 }
 
 pub fn stat(path: &str) -> Result<Stat, Errno> {
-    let mut raw = [0u64; 2];
+    let mut raw = [0u64; 3];
     let ret = unsafe { syscall6(sys::STAT, path.as_ptr() as u64, path.len() as u64, raw.as_mut_ptr() as u64, 0, 0, 0) };
     check(ret)?;
-    Ok(Stat { kind: kind_from(raw[0]), size: raw[1] })
+    Ok(stat_from(raw))
 }
 
 pub fn fstat(fd: Fd) -> Result<Stat, Errno> {
-    let mut raw = [0u64; 2];
+    let mut raw = [0u64; 3];
     check(unsafe { syscall(sys::FSTAT, fd, raw.as_mut_ptr() as u64, 0) })?;
-    Ok(Stat { kind: kind_from(raw[0]), size: raw[1] })
+    Ok(stat_from(raw))
+}
+
+/// Move `old` to `new`, replacing a file (or empty directory) there. Both
+/// must be on the same filesystem (else EXDEV).
+pub fn rename(old: &str, new: &str) -> Result<(), Errno> {
+    let ret = unsafe {
+        syscall6(sys::RENAME, old.as_ptr() as u64, old.len() as u64, new.as_ptr() as u64, new.len() as u64, 0, 0)
+    };
+    check(ret).map(|_| ())
+}
+
+/// Sizes of the filesystem `path` is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FsStats {
+    pub block_size: u64,
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    /// 0 for filesystems without an inode limit (the in-memory root).
+    pub total_inodes: u64,
+    pub free_inodes: u64,
+}
+
+pub fn statfs(path: &str) -> Result<FsStats, Errno> {
+    let mut raw = [0u64; 5];
+    let ret = unsafe { syscall6(sys::STATFS, path.as_ptr() as u64, path.len() as u64, raw.as_mut_ptr() as u64, 0, 0, 0) };
+    check(ret)?;
+    Ok(FsStats { block_size: raw[0], total_blocks: raw[1], free_blocks: raw[2], total_inodes: raw[3], free_inodes: raw[4] })
 }
 
 pub fn mkdir(path: &str) -> Result<(), Errno> {

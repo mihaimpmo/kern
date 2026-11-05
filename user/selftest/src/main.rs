@@ -500,126 +500,13 @@ fn run_redirected(target: fs::Fd, path: &str, mode: u64, args: &[&str]) -> Resul
 fn files(t: &mut Suite) {
     // Programs come from the initramfs.
     let s = fs::stat("/bin/selftest");
-    check!(t, "/bin/selftest is a file", matches!(s, Ok(fs::Stat { kind: Kind::File, size }) if size > 0), "{:?}", s);
+    check!(t, "/bin/selftest is a file", matches!(s, Ok(fs::Stat { kind: Kind::File, size, .. }) if size > 0), "{:?}", s);
     let head = fs::read_file("/bin/selftest").map(|d| d.get(..4) == Some(b"\x7fELF"));
     check!(t, "reading a program file", head == Ok(true), "{:?}", head);
     let r = ulib::spawn("/bin/selftest", &["exit", "4"]).and_then(ulib::wait);
     check!(t, "spawn by absolute path", r == exited(4), "{:?}", r);
-
-    // Create, write, read back.
-    let _ = fs::mkdir("/tmp/st");
-    check!(t, "mkdir twice is EEXIST", fs::mkdir("/tmp/st") == Err(Errno::EEXIST));
-    let r = write_file("/tmp/st/a.txt", b"hello world");
-    check!(t, "create and write a file", r.is_ok(), "{:?}", r);
-    let s = fs::stat("/tmp/st/a.txt");
-    check!(t, "stat reports the size", s.map(|s| s.size) == Ok(11), "{:?}", s);
-    let d = fs::read_file("/tmp/st/a.txt");
-    check!(t, "read the file back", d.as_deref() == Ok(&b"hello world"[..]), "{:?}", d);
-
-    // Offsets, appending, truncation, exclusive creation.
-    if let Ok(fd) = fs::open("/tmp/st/a.txt", flags::READ_WRITE) {
-        let mut buf = [0u8; 5];
-        let r = fs::seek(fd, 6, Whence::Start).and_then(|_| ulib::read(fd, &mut buf));
-        check!(t, "seek then read", r == Ok(5) && &buf == b"world", "{:?}", r);
-        let end = fs::seek(fd, 0, Whence::End);
-        check!(t, "seek to the end", end == Ok(11), "{:?}", end);
-        let dup = fs::dup(fd, 0);
-        let _ = fs::seek(fd, 0, Whence::Start);
-        let mut a = [0u8; 3];
-        let mut b = [0u8; 3];
-        let _ = ulib::read(fd, &mut a);
-        let _ = dup.and_then(|d| ulib::read(d, &mut b));
-        check!(t, "dup shares the offset", &a == b"hel" && &b == b"lo ", "{:?} {:?}", a, b);
-        if let Ok(d) = dup {
-            let _ = fs::close(d);
-        }
-        let _ = fs::close(fd);
-    }
-    if let Ok(fd) = fs::open("/tmp/st/a.txt", flags::WRITE_ONLY | flags::APPEND) {
-        let _ = fs::seek(fd, 0, Whence::Start); // ignored: appends go to the end
-        let _ = ulib::write_all(fd, b"!");
-        let _ = fs::close(fd);
-    }
-    let d = fs::read_file("/tmp/st/a.txt");
-    check!(t, "O_APPEND writes at the end", d.as_deref() == Ok(&b"hello world!"[..]), "{:?}", d);
-    let r = fs::open("/tmp/st/a.txt", flags::WRITE_ONLY | flags::CREATE | flags::EXCLUSIVE);
-    check!(t, "O_EXCL on an existing file is EEXIST", r == Err(Errno::EEXIST), "{:?}", r);
-    if let Ok(fd) = fs::open("/tmp/st/a.txt", flags::WRITE_ONLY | flags::TRUNCATE) {
-        let _ = fs::close(fd);
-    }
-    check!(t, "O_TRUNC empties the file", fs::stat("/tmp/st/a.txt").map(|s| s.size) == Ok(0));
-    let _ = write_file("/tmp/st/a.txt", b"abc");
-
-    // Directories.
-    let _ = fs::mkdir("/tmp/st/d");
-    let names: Vec<(String, Kind)> = fs::read_dir("/tmp/st")
-        .map(|dir| dir.flatten().map(|e| (String::from(e.name()), e.kind)).collect())
-        .unwrap_or_default();
-    let want = [(String::from("a.txt"), Kind::File), (String::from("d"), Kind::Dir)];
-    check!(t, "readdir lists entries in order", names == want, "{:?}", names);
     let devices = fs::read_dir("/dev").map(|d| d.flatten().filter(|e| e.kind == Kind::Device).count());
     check!(t, "/dev has the console and null", devices == Ok(2), "{:?}", devices);
-
-    // Relative paths and the working directory.
-    let mut buf = [0u8; 64];
-    let r = fs::chdir("/tmp/st");
-    let cwd = fs::getcwd(&mut buf).map(String::from);
-    check!(t, "chdir and getcwd", r.is_ok() && cwd.as_deref() == Ok("/tmp/st"), "{:?} {:?}", r, cwd);
-    check!(t, "relative path", fs::stat("a.txt").map(|s| s.size) == Ok(3));
-    check!(t, "path with . and ..", fs::stat("../st/./d/../a.txt").map(|s| s.size) == Ok(3));
-    let r = ulib::spawn("../../bin/selftest", &["exit", "6"]).and_then(ulib::wait);
-    check!(t, "spawn by relative path", r == exited(6), "{:?}", r);
-    check!(t, "chdir to a file is ENOTDIR", fs::chdir("a.txt") == Err(Errno::ENOTDIR));
-    let _ = fs::chdir("/");
-    let _ = fs::chdir("..");
-    check!(t, ".. at / stays at /", fs::getcwd(&mut buf) == Ok("/"));
-
-    // Errors.
-    check!(t, "open of a missing file is ENOENT", fs::open("/tmp/st/nope", flags::READ_ONLY) == Err(Errno::ENOENT));
-    check!(t, "writing a directory is EISDIR", fs::open("/tmp/st", flags::WRITE_ONLY) == Err(Errno::EISDIR));
-    let r = fs::open("/tmp/st/a.txt", flags::READ_ONLY | flags::DIRECTORY);
-    check!(t, "O_DIRECTORY on a file is ENOTDIR", r == Err(Errno::ENOTDIR), "{:?}", r);
-    check!(t, "mkdir in a missing directory is ENOENT", fs::mkdir("/tmp/nope/x") == Err(Errno::ENOENT));
-    check!(t, "removing a non-empty directory is ENOTEMPTY", fs::unlink("/tmp/st") == Err(Errno::ENOTEMPTY));
-    check!(t, "removing a missing file is ENOENT", fs::unlink("/tmp/st/nope") == Err(Errno::ENOENT));
-    let long = [b'x'; 300];
-    let r = fs::stat(core::str::from_utf8(&long).unwrap());
-    check!(t, "a 300-byte name is ENAMETOOLONG", r == Err(Errno::ENAMETOOLONG), "{:?}", r);
-    check!(t, "readdir on a file is ENOTDIR", fs::read_dir("/tmp/st/a.txt").err() == Some(Errno::ENOTDIR));
-    if let Ok(fd) = fs::open("/tmp/st/a.txt", flags::READ_ONLY) {
-        check!(t, "writing a read-only fd is EBADF", ulib::write(fd, b"x") == Err(Errno::EBADF));
-        let _ = fs::close(fd);
-        let mut b = [0u8; 1];
-        check!(t, "reading a closed fd is EBADF", ulib::read(fd, &mut b) == Err(Errno::EBADF));
-    }
-    let mut fds = Vec::new();
-    let full = loop {
-        match fs::open("/tmp/st/a.txt", flags::READ_ONLY) {
-            Ok(fd) if fds.len() < 100 => fds.push(fd),
-            other => break other,
-        }
-    };
-    check!(t, "running out of fds is EMFILE", full == Err(Errno::EMFILE), "{:?} after {}", full, fds.len());
-    for fd in fds {
-        let _ = fs::close(fd);
-    }
-
-    // Children inherit descriptors: that's how the shell redirects.
-    let out = flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE;
-    let r = run_redirected(ulib::STDOUT, "/tmp/st/out", out, &["say", "redirected"]);
-    let d = fs::read_file("/tmp/st/out");
-    check!(t, "child output into a file", r == exited(0) && d.as_deref() == Ok(&b"redirected\n"[..]), "{:?} {:?}", r, d);
-    let r = run_redirected(ulib::STDIN, "/tmp/st/a.txt", flags::READ_ONLY, &["stdin-len"]);
-    check!(t, "child input from a file", r == exited(3), "{:?}", r);
-
-    // An unlinked file lives on while open.
-    let fd = fs::open("/tmp/st/a.txt", flags::READ_ONLY);
-    let gone = fs::unlink("/tmp/st/a.txt");
-    let d = fd.and_then(fs::read_to_end);
-    check!(t, "unlinked file still readable while open", gone.is_ok() && d.as_deref() == Ok(&b"abc"[..]), "{:?}", d);
-    if let Ok(fd) = fd {
-        let _ = fs::close(fd);
-    }
     let null = fs::open("/dev/null", flags::READ_WRITE);
     let mut b = [0u8; 4];
     let ok = null.map_or(false, |fd| ulib::write(fd, b"gone") == Ok(4) && ulib::read(fd, &mut b) == Ok(0));
@@ -627,11 +514,260 @@ fn files(t: &mut Suite) {
     if let Ok(fd) = null {
         let _ = fs::close(fd);
     }
+    let mut buf = [0u8; 64];
+    let _ = fs::chdir("/");
+    let _ = fs::chdir("..");
+    check!(t, ".. at / stays at /", fs::getcwd(&mut buf) == Ok("/"));
+    let long = [b'x'; 300];
+    let r = fs::stat(core::str::from_utf8(&long).unwrap());
+    check!(t, "a 300-byte name is ENAMETOOLONG", r == Err(Errno::ENAMETOOLONG), "{:?}", r);
 
-    for path in ["/tmp/st/out", "/tmp/st/d", "/tmp/st"] {
-        let _ = fs::unlink(path);
+    // The same behaviour from the in-memory filesystem and from the disk.
+    file_suite(t, "/tmp");
+    match fs::stat("/disk") {
+        Ok(s) if s.kind == Kind::Dir => {
+            file_suite(t, "/disk");
+            disk(t);
+        }
+        _ => println!("# no disk at /disk: skipping the disk checks"),
     }
-    check!(t, "cleanup", fs::stat("/tmp/st") == Err(Errno::ENOENT));
+}
+
+/// Generic file and directory behaviour, in `base`/st.
+fn file_suite(t: &mut Suite, base: &str) {
+    let dir = alloc::format!("{}/st", base);
+    let path = |name: &str| alloc::format!("{}/{}", dir, name);
+    let name = |what: &str| alloc::format!("{}: {}", base, what);
+    let a = path("a.txt");
+
+    // Create, write, read back.
+    let _ = fs::mkdir(&dir);
+    check!(t, &name("mkdir twice is EEXIST"), fs::mkdir(&dir) == Err(Errno::EEXIST));
+    let r = write_file(&a, b"hello world");
+    check!(t, &name("create and write a file"), r.is_ok(), "{:?}", r);
+    let s = fs::stat(&a);
+    check!(t, &name("stat reports the size"), s.map(|s| s.size) == Ok(11), "{:?}", s);
+    let d = fs::read_file(&a);
+    check!(t, &name("read the file back"), d.as_deref() == Ok(&b"hello world"[..]), "{:?}", d);
+
+    // Offsets, appending, truncation, exclusive creation.
+    if let Ok(fd) = fs::open(&a, flags::READ_WRITE) {
+        let mut buf = [0u8; 5];
+        let r = fs::seek(fd, 6, Whence::Start).and_then(|_| ulib::read(fd, &mut buf));
+        check!(t, &name("seek then read"), r == Ok(5) && &buf == b"world", "{:?}", r);
+        let end = fs::seek(fd, 0, Whence::End);
+        check!(t, &name("seek to the end"), end == Ok(11), "{:?}", end);
+        let dup = fs::dup(fd, 0);
+        let _ = fs::seek(fd, 0, Whence::Start);
+        let mut x = [0u8; 3];
+        let mut y = [0u8; 3];
+        let _ = ulib::read(fd, &mut x);
+        let _ = dup.and_then(|d| ulib::read(d, &mut y));
+        check!(t, &name("dup shares the offset"), &x == b"hel" && &y == b"lo ", "{:?} {:?}", x, y);
+        if let Ok(d) = dup {
+            let _ = fs::close(d);
+        }
+        let _ = fs::close(fd);
+    }
+    if let Ok(fd) = fs::open(&a, flags::WRITE_ONLY | flags::APPEND) {
+        let _ = fs::seek(fd, 0, Whence::Start); // ignored: appends go to the end
+        let _ = ulib::write_all(fd, b"!");
+        let _ = fs::close(fd);
+    }
+    let d = fs::read_file(&a);
+    check!(t, &name("O_APPEND writes at the end"), d.as_deref() == Ok(&b"hello world!"[..]), "{:?}", d);
+    let r = fs::open(&a, flags::WRITE_ONLY | flags::CREATE | flags::EXCLUSIVE);
+    check!(t, &name("O_EXCL on an existing file is EEXIST"), r == Err(Errno::EEXIST), "{:?}", r);
+    if let Ok(fd) = fs::open(&a, flags::WRITE_ONLY | flags::TRUNCATE) {
+        let _ = fs::close(fd);
+    }
+    check!(t, &name("O_TRUNC empties the file"), fs::stat(&a).map(|s| s.size) == Ok(0));
+    let _ = write_file(&a, b"abc");
+    let s = fs::stat(&a);
+    check!(t, &name("stat reports a modification time"), s.map_or(false, |s| s.mtime > 1_577_836_800), "{:?}", s);
+
+    // Directories.
+    let _ = fs::mkdir(&path("d"));
+    let names: Vec<(String, Kind)> = fs::read_dir(&dir)
+        .map(|dir| dir.flatten().map(|e| (String::from(e.name()), e.kind)).collect())
+        .unwrap_or_default();
+    let want = [(String::from("a.txt"), Kind::File), (String::from("d"), Kind::Dir)];
+    check!(t, &name("readdir lists entries in order"), names == want, "{:?}", names);
+
+    // Relative paths and the working directory.
+    let mut buf = [0u8; 64];
+    let r = fs::chdir(&dir);
+    let cwd = fs::getcwd(&mut buf).map(String::from);
+    check!(t, &name("chdir and getcwd"), r.is_ok() && cwd.as_deref() == Ok(&dir[..]), "{:?} {:?}", r, cwd);
+    check!(t, &name("relative path"), fs::stat("a.txt").map(|s| s.size) == Ok(3));
+    check!(t, &name("path with . and .."), fs::stat("../st/./d/../a.txt").map(|s| s.size) == Ok(3));
+    let r = ulib::spawn("../../bin/selftest", &["exit", "6"]).and_then(ulib::wait);
+    check!(t, &name("spawn by relative path"), r == exited(6), "{:?}", r);
+    check!(t, &name("chdir to a file is ENOTDIR"), fs::chdir("a.txt") == Err(Errno::ENOTDIR));
+    let _ = fs::chdir("/");
+
+    // Errors.
+    check!(t, &name("open of a missing file is ENOENT"), fs::open(&path("nope"), flags::READ_ONLY) == Err(Errno::ENOENT));
+    check!(t, &name("writing a directory is EISDIR"), fs::open(&dir, flags::WRITE_ONLY) == Err(Errno::EISDIR));
+    let r = fs::open(&a, flags::READ_ONLY | flags::DIRECTORY);
+    check!(t, &name("O_DIRECTORY on a file is ENOTDIR"), r == Err(Errno::ENOTDIR), "{:?}", r);
+    check!(t, &name("mkdir in a missing directory is ENOENT"), fs::mkdir(&path("nope/x")) == Err(Errno::ENOENT));
+    check!(t, &name("removing a non-empty directory is ENOTEMPTY"), fs::unlink(&dir) == Err(Errno::ENOTEMPTY));
+    check!(t, &name("removing a missing file is ENOENT"), fs::unlink(&path("nope")) == Err(Errno::ENOENT));
+    check!(t, &name("readdir on a file is ENOTDIR"), fs::read_dir(&a).err() == Some(Errno::ENOTDIR));
+    if let Ok(fd) = fs::open(&a, flags::READ_ONLY) {
+        check!(t, &name("writing a read-only fd is EBADF"), ulib::write(fd, b"x") == Err(Errno::EBADF));
+        let _ = fs::close(fd);
+        let mut b = [0u8; 1];
+        check!(t, &name("reading a closed fd is EBADF"), ulib::read(fd, &mut b) == Err(Errno::EBADF));
+    }
+    let mut fds = Vec::new();
+    let full = loop {
+        match fs::open(&a, flags::READ_ONLY) {
+            Ok(fd) if fds.len() < 100 => fds.push(fd),
+            other => break other,
+        }
+    };
+    check!(t, &name("running out of fds is EMFILE"), full == Err(Errno::EMFILE), "{:?} after {}", full, fds.len());
+    for fd in fds {
+        let _ = fs::close(fd);
+    }
+
+    // Renaming.
+    let b = path("b.txt");
+    let _ = write_file(&b, b"old b");
+    let r = fs::rename(&a, &b);
+    let d = fs::read_file(&b);
+    check!(t, &name("rename replaces the target"), r.is_ok() && d.as_deref() == Ok(&b"abc"[..]), "{:?} {:?}", r, d);
+    check!(t, &name("the old name is gone"), fs::stat(&a) == Err(Errno::ENOENT));
+    let r = fs::rename(&b, &path("d/moved.txt")).and_then(|_| fs::rename(&path("d/moved.txt"), &a));
+    check!(t, &name("rename between directories"), r.is_ok() && fs::stat(&a).map(|s| s.size) == Ok(3), "{:?}", r);
+    let _ = fs::mkdir(&path("d/inner"));
+    check!(t, &name("rename a file over a directory is EISDIR"), fs::rename(&a, &path("d")) == Err(Errno::EISDIR));
+    check!(t, &name("rename a directory over a file is ENOTDIR"), fs::rename(&path("d"), &a) == Err(Errno::ENOTDIR));
+    let _ = fs::mkdir(&path("e"));
+    check!(t, &name("rename over a non-empty directory is ENOTEMPTY"), fs::rename(&path("e"), &path("d")) == Err(Errno::ENOTEMPTY));
+    check!(t, &name("moving a directory into itself is EINVAL"), fs::rename(&path("d"), &path("d/inner/x")) == Err(Errno::EINVAL));
+    let r = fs::rename(&path("d/inner"), &path("e2")).and_then(|_| fs::rename(&path("e2"), &path("e")));
+    check!(t, &name("rename a directory over an empty one"), r.is_ok() && fs::stat(&path("e")).is_ok(), "{:?}", r);
+    let _ = fs::unlink(&path("e"));
+
+    // Children inherit descriptors: that's how the shell redirects.
+    let out = flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE;
+    let r = run_redirected(ulib::STDOUT, &path("out"), out, &["say", "redirected"]);
+    let d = fs::read_file(&path("out"));
+    check!(t, &name("child output into a file"), r == exited(0) && d.as_deref() == Ok(&b"redirected\n"[..]), "{:?} {:?}", r, d);
+    let r = run_redirected(ulib::STDIN, &a, flags::READ_ONLY, &["stdin-len"]);
+    check!(t, &name("child input from a file"), r == exited(3), "{:?}", r);
+
+    // An unlinked file lives on while open.
+    let fd = fs::open(&a, flags::READ_ONLY);
+    let gone = fs::unlink(&a);
+    let d = fd.and_then(fs::read_to_end);
+    check!(t, &name("unlinked file still readable while open"), gone.is_ok() && d.as_deref() == Ok(&b"abc"[..]), "{:?}", d);
+    if let Ok(fd) = fd {
+        let _ = fs::close(fd);
+    }
+
+    for p in [path("out"), path("d"), dir.clone()] {
+        let _ = fs::unlink(&p);
+    }
+    check!(t, &name("cleanup"), fs::stat(&dir) == Err(Errno::ENOENT));
+}
+
+fn disk_free() -> (u64, u64) {
+    fs::statfs("/disk").map_or((0, 0), |s| (s.free_blocks, s.free_inodes))
+}
+
+/// What only the disk does: persistence, big and sparse files, running out
+/// of space, and giving every block back.
+fn disk(t: &mut Suite) {
+    // Counts the boots this disk has seen; tests/run.py boots twice on the
+    // same image and checks the second boot sees the first.
+    let boots = fs::read_file("/disk/boots")
+        .ok()
+        .and_then(|d| core::str::from_utf8(&d).ok()?.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    println!("# disk has seen {} earlier boot(s)", boots);
+    let r = write_file("/disk/boots", alloc::format!("{}\n", boots + 1).as_bytes());
+    check!(t, "/disk: boot counter updated", r.is_ok(), "{:?}", r);
+    let before = disk_free();
+    let stats = fs::statfs("/disk");
+    check!(t, "/disk: statfs", stats.map_or(false, |s| s.block_size == 4096 && s.free_blocks > 0 && s.total_inodes > 0), "{:?}", stats);
+    check!(t, "/disk: rename to another filesystem is EXDEV", fs::rename("/disk/boots", "/tmp/boots") == Err(Errno::EXDEV));
+    let long = [b'n'; 249]; // the VFS allows 255, KFS stores 248
+    let r = write_file(&alloc::format!("/disk/{}", core::str::from_utf8(&long).unwrap()), b"x");
+    check!(t, "/disk: a 249-byte name is ENAMETOOLONG", r == Err(Errno::ENAMETOOLONG), "{:?}", r);
+
+    // 5 MiB: past the direct and indirect blocks into the double-indirect ones.
+    const BIG: usize = 5 << 20;
+    let pattern = |i: usize| (i % 251) as u8 ^ (i / 4096) as u8;
+    let data: Vec<u8> = (0..BIG).map(pattern).collect();
+    let r = write_file("/disk/big", &data);
+    drop(data);
+    let back = fs::read_file("/disk/big");
+    let same = back.as_ref().map_or(false, |d| d.len() == BIG && d.iter().enumerate().all(|(i, &b)| b == pattern(i)));
+    check!(t, "/disk: 5 MiB file round-trips", r.is_ok() && same, "{:?}", r);
+    drop(back);
+
+    // A sparse file: the hole reads as zeros and takes no space.
+    let free_before_sparse = disk_free().0;
+    let sparse = fs::open("/disk/sparse", flags::READ_WRITE | flags::CREATE).and_then(|fd| {
+        fs::seek(fd, 10 << 20, Whence::Start)?;
+        ulib::write_all(fd, b"end")?;
+        let mut head = [1u8; 4096];
+        fs::seek(fd, 4096 * 100, Whence::Start)?;
+        let n = ulib::read(fd, &mut head)?;
+        let _ = fs::close(fd);
+        Ok(n == 4096 && head.iter().all(|&b| b == 0))
+    });
+    let size = fs::stat("/disk/sparse").map(|s| s.size);
+    let used = free_before_sparse - disk_free().0;
+    check!(t, "/disk: sparse file", sparse == Ok(true) && size == Ok((10 << 20) + 3) && used <= 4, "{:?} {:?}, {} blocks", sparse, size, used);
+
+    // Many entries: a directory bigger than one block.
+    let _ = fs::mkdir("/disk/many");
+    let mut ok = true;
+    for i in 0..40 {
+        ok &= write_file(&alloc::format!("/disk/many/f{:02}", i), b"").is_ok();
+    }
+    let listed: Vec<String> = fs::read_dir("/disk/many").map(|d| d.flatten().map(|e| String::from(e.name())).collect()).unwrap_or_default();
+    let want: Vec<String> = (0..40).map(|i| alloc::format!("f{:02}", i)).collect();
+    check!(t, "/disk: a directory of 40 entries", ok && listed == want, "{} listed", listed.len());
+    for i in 0..40 {
+        let _ = fs::unlink(&alloc::format!("/disk/many/f{:02}", i));
+    }
+    let r = fs::unlink("/disk/many");
+    check!(t, "/disk: emptied directory can be removed", r.is_ok(), "{:?}", r);
+
+    // Fill the disk: writes stop with ENOSPC, and everything comes back.
+    let chunk = alloc::vec![0x5au8; 1 << 20];
+    let fill = fs::open("/disk/fill", flags::WRITE_ONLY | flags::CREATE);
+    let mut error = None;
+    if let Ok(fd) = fill {
+        for _ in 0..4096 {
+            if let Err(e) = ulib::write_all(fd, &chunk) {
+                error = Some(e);
+                break;
+            }
+        }
+        let _ = fs::close(fd);
+    }
+    check!(t, "/disk: a full disk is ENOSPC", error == Some(Errno::ENOSPC), "{:?}", error);
+    check!(t, "/disk: statfs shows the disk full", disk_free().0 == 0, "{:?}", disk_free());
+
+    // An unlinked file's blocks are freed only when it is closed.
+    let held = fs::open("/disk/big", flags::READ_ONLY);
+    for p in ["/disk/fill", "/disk/sparse", "/disk/big"] {
+        let _ = fs::unlink(p);
+    }
+    let while_open = disk_free().0;
+    if let Ok(fd) = held {
+        let _ = fs::close(fd);
+    }
+    let after = disk_free();
+    check!(t, "/disk: an open unlinked file keeps its blocks", while_open + 1280 <= after.0, "{} then {}", while_open, after.0);
+    check!(t, "/disk: every block and inode is given back", after == before, "{:?} -> {:?}", before, after);
 }
 
 /// Spawn `selftest <args>` with its stdin/stdout pointed at the given fds.

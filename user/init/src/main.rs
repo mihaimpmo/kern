@@ -29,7 +29,7 @@ builtins:
   history             recent commands (Up/Down recall them)
   clear               clear the screen
 programs (in /bin; try `ls /bin`):
-  echo, cat, ls, mkdir, rm, wc, ps, kill, sleep, date, hello, spin, crash, selftest
+  echo, cat, ls, mkdir, rm, mv, wc, df, ps, kill, sleep, date, hello, spin, crash, selftest
 running:
   cmd args            run and wait; Ctrl+C interrupts it
   cmd args &          run in the background
