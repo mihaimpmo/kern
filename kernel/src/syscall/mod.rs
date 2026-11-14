@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! System calls via the `syscall` instruction.
 //!
 //! ABI (same registers as Linux): number in rax, arguments in rdi, rsi, rdx,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Pipes: a bounded byte buffer with a read end and a write end.
 //!
 //! Each end is one inode, shared by every descriptor that refers to it

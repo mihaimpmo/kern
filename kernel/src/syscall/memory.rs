@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory system calls (see mm/uspace.rs for the model).
 
 use super::{with_user_space, SysResult, EINVAL};

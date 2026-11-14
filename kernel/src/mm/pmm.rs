@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Physical memory manager: a free list of 4 KiB frames.
 //! Each free frame stores the physical address of the next free frame in its
 //! first 8 bytes (accessed through the HHDM), so the allocator needs no

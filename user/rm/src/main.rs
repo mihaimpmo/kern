@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! rm <path...>: remove files and empty directories.
 
 #![no_std]

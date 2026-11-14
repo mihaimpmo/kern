@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x87/SSE state for user programs.
 //!
 //! The kernel is built without floating point (a soft-float target), so it

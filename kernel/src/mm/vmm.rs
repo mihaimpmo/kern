@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Virtual memory: 4-level x86-64 page tables.
 //!
 //! All address spaces share the kernel half (PML4 entries 256..512). Those

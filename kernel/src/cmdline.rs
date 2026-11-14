@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kernel command line (the `cmdline:` line in limine.conf): space-separated
 //! words, either `key=value` or bare flags.
 //!

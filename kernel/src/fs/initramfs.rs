@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The initramfs: a ustar archive loaded by Limine as a boot module (see
 //! the Makefile), unpacked into the root filesystem at boot. Only regular
 //! files and directories are used; anything else is skipped.

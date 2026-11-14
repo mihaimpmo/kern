@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Limine boot protocol requests (see https://github.com/limine-bootloader/limine-protocol).
 //! The bootloader scans the `.limine_requests` section, fills in the
 //! `response` pointers, then jumps to `kmain`.

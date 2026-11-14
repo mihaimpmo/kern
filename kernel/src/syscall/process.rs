@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Process system calls: spawn, wait, and process information.
 
 use super::{check_user, copy_from_user, copy_out, copy_to_user, user_bytes, user_path, Errno, SysResult};

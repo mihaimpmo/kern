@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kernel console: text on the framebuffer plus a copy on the serial port.
 //! Understands a small subset of ANSI escapes (colours, clear screen,
 //! cursor home, clear line) so user programs can use them.

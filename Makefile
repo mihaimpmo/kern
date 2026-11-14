@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 # Kern build. Needs: Rust (with the rust-src component), xorriso, git, make, a C compiler.
 # Optional: qemu-system-x86_64 and OVMF to test without real hardware.
 

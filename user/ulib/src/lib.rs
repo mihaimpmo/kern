@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ulib: the tiny standard library for Kern user programs.
 //!
 //! Programs define `#[no_mangle] fn main() -> i32` and get `print!`,

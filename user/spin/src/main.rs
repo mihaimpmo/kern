@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! spin: burns CPU for 3 seconds without ever yielding. Run `spin &` and the
 //! shell still responds, because the timer interrupt preempts this process.
 

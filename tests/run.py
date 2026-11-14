@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Kern test runner (`make test`).
 
 1. selftest: boots the test ISO (pid 1 = `selftest`, `qemu-exit` on the

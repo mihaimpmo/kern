@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! cat [file...]: copy files (or standard input) to standard output.
 
 #![no_std]

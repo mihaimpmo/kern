@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Files and directories.
 
 use crate::{check, syscall, syscall6, sys, Errno};

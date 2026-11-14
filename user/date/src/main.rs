@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! date: the current date and time (UTC).
 
 #![no_std]

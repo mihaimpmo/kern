@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Minimal ACPI table parsing: finds the MADT to learn about the interrupt
 //! controllers and CPUs. (Full ACPI needs an AML interpreter, e.g. uACPI.)
 

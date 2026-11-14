@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A process's user address space: its page tables plus the regions it may
 //! use.
 //!

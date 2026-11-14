@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Thin wrappers around x86-64 instructions.
 
 use core::arch::asm;

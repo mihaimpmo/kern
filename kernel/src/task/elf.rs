@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ELF64 loader for user programs (static executables, no dynamic linking).
 
 use super::exec::LoadError::{self, BadElf};

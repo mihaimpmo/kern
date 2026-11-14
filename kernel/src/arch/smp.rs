@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Starting the other CPUs (application processors, APs).
 //!
 //! Limine has already woken every CPU and parked it in a loop watching its

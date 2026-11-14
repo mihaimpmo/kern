@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Building a new process image: ELF segments, a stack, and the System V
 //! process-entry block on top of the stack.
 //!

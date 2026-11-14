@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The global allocator: a linked-list heap on memory from `brk`, grown on
 //! demand (the kernel maps the pages when they are first touched).
 //!

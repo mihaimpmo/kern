@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Local APIC (timer, EOI, IPIs) and I/O APIC (routing of device IRQs).
 //! Supports both xAPIC (MMIO) and x2APIC (MSR) mode, since firmware on newer
 //! machines often leaves the CPU in x2APIC mode. Every CPU has its own local

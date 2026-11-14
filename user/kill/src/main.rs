@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! kill [-SIGNAL] <pid>...: send a signal (default SIGTERM). A negative pid
 //! means a process group; the signal is a name (TERM, SIGINT) or a number.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ls [path...]: list directories (the working directory by default).
 //! Directories are shown with a trailing '/', devices with '*', pipes '|'.
 

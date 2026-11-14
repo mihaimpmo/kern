@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Interrupt Descriptor Table. Every vector points to a generated stub
 //! (see build.rs) which funnels into `interrupts::interrupt_dispatch`.
 //! One table, filled in once by the boot CPU and loaded by every CPU.

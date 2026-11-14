@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Tasks and the preemptive round-robin scheduler, shared by all CPUs.
 //!
 //! Every task (kernel thread or user process) has its own kernel stack.

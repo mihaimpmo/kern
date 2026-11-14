@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Stopping the system: when pid 1 exits, and on panic.
 
 use crate::arch::{apic, cpu, smp};

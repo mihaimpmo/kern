@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kernel stacks for tasks. Each stack sits in its own 64 KiB slot with the
 //! bottom of the slot left unmapped, so a stack overflow hits a guard page and
 //! causes a clean double fault instead of silently corrupting memory.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Per-CPU data, reached through the GS segment base while in kernel mode.
 //!
 //! Each CPU gets one `PerCpu` (leaked, so it lives forever) holding the

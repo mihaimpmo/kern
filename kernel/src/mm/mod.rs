@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory management.
 //!
 //! Virtual address space layout (4-level paging):
