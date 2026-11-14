@@ -148,3 +148,15 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 - **Address space:** user space is `0x0`–`0x7fff_ffff_ffff`; the kernel half (`0xffff_8000_...` and up) is shared by all processes and not accessible from ring 3.
 - **Locking:** `SpinLock` disables interrupts while held, so interrupt handlers can't deadlock against the code they interrupted. The scheduler is one spinlock around a shared ready queue, held across the context switch and released by the task that resumes.
 - **Process exit:** a process can't free the stack it's running on, so exit marks it a zombie and the scheduler frees its memory on the next switch. The exit status (code, or the signal that killed it) is kept until the parent collects it with `wait`.
+
+## License
+
+Copyright (C) 2026 Mihai Petrar
+
+Kern is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License, version 2 only, as published by the
+Free Software Foundation.
+
+Kern is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for details.

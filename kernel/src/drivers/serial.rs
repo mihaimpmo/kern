@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! 16550 UART on COM1. Most laptops have no serial port; in that case the
 //! loopback test fails and output silently goes to the screen only.
 //!

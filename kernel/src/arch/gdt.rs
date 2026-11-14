@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Global Descriptor Table and Task State Segment.
 //!
 //! The selector layout is dictated by `syscall`/`sysret`:

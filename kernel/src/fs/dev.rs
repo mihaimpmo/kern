@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Devices in /dev.
 
 use super::{FsError, Inode, Kind, Result};

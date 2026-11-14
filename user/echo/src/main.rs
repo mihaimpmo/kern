@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! echo [text...]: print the arguments, separated by spaces.
 
 #![no_std]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! wc [-l] [-w] [-c] [file...]: count lines, words and bytes of files (or
 //! standard input). Without options, all three.
 

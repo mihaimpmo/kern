@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Build script: generates the 256 interrupt entry stubs and passes the linker script.
 use std::{env, fmt::Write, fs, path::PathBuf};
 

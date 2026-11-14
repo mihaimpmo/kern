@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! In-memory files and directories. Contents live in the kernel heap and
 //! are gone at reboot.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! sleep <seconds>: wait, e.g. `sleep 2` or `sleep 0.25`.
 
 #![no_std]

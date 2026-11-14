@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kernel heap. Backed by `linked_list_allocator`; when it runs out, more
 //! pages are mapped at the end of the heap region and the heap is extended.
 

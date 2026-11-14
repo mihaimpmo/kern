@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Kernel lives in the top 2 GiB of the address space (code-model=kernel). */
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(kmain)

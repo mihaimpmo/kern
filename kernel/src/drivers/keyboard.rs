@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PS/2 keyboard through the i8042 controller (US layout, scancode set 1).
 //! Laptop built-in keyboards are almost always wired this way, even today.
 //! USB keyboards need an xHCI + HID driver, which this kernel doesn't have yet;

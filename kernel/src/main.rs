@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kern: a small monolithic x86-64 kernel.
 //!
 //! Boot order: serial -> framebuffer console -> boot GDT + IDT -> FPU ->

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! hello: prints a few lines with pauses. Run it with `hello &` a couple of
 //! times to watch several processes take turns. `hello <n>` prints n lines.
 

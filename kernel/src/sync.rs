@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Synchronisation primitives: `SpinLock` (interrupts off, never sleeps),
 //! `Mutex` (sleeps, interrupts on), `BootCell` (written only during boot).
 //!

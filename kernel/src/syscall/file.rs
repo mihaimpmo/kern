@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! File system calls. File operations may block (console input, a sleeping
 //! lock), so no spinlock is held across them: the open file is looked up,
 //! the descriptor table unlocked, then the file used.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! init: the first user program, and the shell.
 //!
 //! A line is a pipeline: commands separated by `|`, each a list of words.

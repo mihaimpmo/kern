@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! crash: deliberately touches memory it doesn't own. The kernel kills this
 //! process and everything else keeps running - that is memory protection.
 

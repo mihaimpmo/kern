@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The virtual file system: one tree of inodes rooted at `/`.
 //!
 //! The root is an in-memory filesystem (`tmpfs`), filled at boot from the

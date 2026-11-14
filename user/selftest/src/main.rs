@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! selftest: checks the kernel from user space. Prints one TAP-style line per
 //! check and exits with the number of failures, so `make test` can boot with
 //! `init=selftest qemu-exit` and read the result from QEMU's exit status.

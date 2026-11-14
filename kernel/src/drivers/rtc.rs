@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The CMOS real-time clock, read once at boot to learn the date. After
 //! that the time of day is the boot time plus the uptime.
 //!
