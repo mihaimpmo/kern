@@ -1,0 +1,86 @@
+# Builds kern.iso on every push and runs the test suite in QEMU. Every push
+# to main that passes becomes a release (build-<run number>) with the ISO
+# attached, marked as the latest, so this link always has the newest one:
+#   https://github.com/<owner>/<repo>/releases/latest/download/kern.iso
+# Other branches only get the ISO as a workflow artifact.
+
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xorriso qemu-system-x86
+
+      # rust-toolchain.toml picks the toolchain and components.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kernel
+            user
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test
+
+      - name: Checksum
+        run: sha256sum kern.iso > kern.iso.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kern-${{ github.sha }}
+          path: |
+            kern.iso
+            kern.iso.sha256
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One release at a time, in push order.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kern-${{ github.sha }}
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+          SUBJECT: ${{ github.event.head_commit.message }}
+        run: |
+          short=$(echo "$GITHUB_SHA" | cut -c1-7)
+          {
+            echo "Automatic build of ${short}: ${SUBJECT%%$'\n'*}"
+            echo
+            echo "Built and tested by [run ${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+            echo "Write \`kern.iso\` to a USB stick (dd, or Rufus in DD mode) or boot it in QEMU."
+            echo
+            echo "SHA-256: \`$(cut -d' ' -f1 kern.iso.sha256)\`"
+          } > notes.md
+          gh release create "$TAG" kern.iso kern.iso.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Kern ${TAG} (${short})" \
+            --notes-file notes.md \
+            --latest

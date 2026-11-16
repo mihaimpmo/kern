@@ -124,6 +124,10 @@ python3 tools/kfs.py check my.img           # verify the whole structure
 
 KFS uses 4 KiB blocks, a superblock, inode and block bitmaps, 128-byte inodes (12 direct, one indirect and one double-indirect block pointer: files up to ~4 GiB) and directories of 256-byte entries (names up to 248 bytes). The full format is in the header of `tools/kfs.py`. Every write reaches the disk before the call returns; there is no journal yet, so a crash in the middle of an operation can leak blocks, which `kfs.py check` reports.
 
+### Prebuilt ISOs
+
+GitHub Actions (`.github/workflows/build.yml`) builds `kern.iso` and runs `make test` on every push. Each push to `main` that passes becomes a release with the ISO attached; the newest is always at [releases/latest/download/kern.iso](https://github.com/mihaimpmo/Kern/releases/latest/download/kern.iso). Pushes to other branches keep their ISO as a workflow artifact.
+
 ## Booting on a real computer
 
 1. Write `kern.iso` to a USB stick. It erases the stick.
