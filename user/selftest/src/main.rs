@@ -10,8 +10,10 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::hint::black_box;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use ulib::signal::{Handler, Regs, SIGCHLD, SIGILL, SIGUSR1, SIGUSR2};
 use ulib::fs::{self, flags, Kind, Whence};
 use ulib::{println, prot, signal, sys, syscall6, Errno, ExitStatus};
 
@@ -28,6 +30,9 @@ fn main() -> i32 {
     for (slot, arg) in args.iter_mut().zip(ulib::args()) {
         *slot = arg;
         argc += 1;
+    }
+    if let Some(code) = signal_mode(&args[1..argc]) {
+        return code;
     }
     match &args[1..argc] {
         [] => run_all(),
@@ -194,6 +199,8 @@ fn run_all() -> i32 {
     files(&mut t);
     pipes(&mut t);
     signals(&mut t);
+    exec(&mut t);
+    handlers(&mut t);
     leaks(&mut t);
     println!("selftest: {} checks, {} failed", t.run, t.failed);
     t.failed as i32
@@ -942,9 +949,321 @@ fn leaks(t: &mut Suite) {
         let _ = run_child(&["hog", "32"]);
         ulib::sleep_ms(20);
     };
+    let round = || {
+        round();
+        let _ = run_child(&["hog-then-exec", "16"]);
+        let _ = run_child(&["catch-many"]);
+    };
     round();
     let before = ulib::sysinfo().free_memory;
     round();
     let after = ulib::sysinfo().free_memory;
     check!(t, "processes return all their memory", after == before, "free {} -> {} bytes", before, after);
+}
+
+// ------------------------------------------------------ exec and handlers
+
+/// Handler calls so far, and the last signal one got.
+static COUNT: AtomicU32 = AtomicU32::new(0);
+static LAST: AtomicU32 = AtomicU32::new(0);
+static DONE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn count(sig: i32) {
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    LAST.store(sig as u32, Ordering::Relaxed);
+}
+
+extern "C" fn finish(_: i32) {
+    DONE.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn exit_42(_: i32) {
+    ulib::exit(42);
+}
+
+/// Counts, and wrecks registers the interrupted code is using.
+extern "C" fn count_and_clobber(sig: i32) {
+    count(sig);
+    unsafe {
+        core::arch::asm!("xor ecx, ecx", "xor r11d, r11d", "pxor xmm0, xmm0", out("rcx") _, out("r11") _, out("xmm0") _);
+    }
+}
+
+/// Steps over the 2-byte `ud2` that raised the signal.
+extern "C" fn skip_ud2(sig: i32, _: usize, regs: *mut Regs) {
+    count(sig);
+    unsafe { (*regs).rip += 2 };
+}
+
+/// Where `bad-mxcsr` resumes: exit 0 if MXCSR's reserved bits are clear.
+extern "C" fn exit_mxcsr_ok() -> ! {
+    let mut mxcsr: u32 = 0;
+    unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr) };
+    ulib::exit((mxcsr >> 16 != 0) as i32)
+}
+
+fn handle(sig: u8, f: extern "C" fn(i32)) {
+    ulib::signal::set_handler(sig, Handler::Call(f)).expect("set_handler");
+}
+
+fn raise(sig: u8) {
+    let _ = ulib::kill(ulib::getpid() as i64, sig);
+}
+
+fn counted() -> u32 {
+    COUNT.load(Ordering::Relaxed)
+}
+
+/// `sigreturn` with a hand-made frame, as a broken or hostile program might.
+fn fake_sigreturn(frame: &ulib::signal::Frame) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {sp}",
+            "mov eax, {n}",
+            "syscall",
+            "ud2",
+            sp = in(reg) frame as *const _ as u64 + 8,
+            n = const sys::SIGRETURN,
+            options(noreturn),
+        )
+    }
+}
+
+fn blank_frame() -> Box<ulib::signal::Frame> {
+    Box::new(ulib::signal::Frame { restorer: 0, sig: 0, regs: Regs::default(), mask: 0, _pad: [0; 2], fpu: [0; 512] })
+}
+
+/// Child modes for the exec and handler checks: Some(exit code).
+fn signal_mode(args: &[&str]) -> Option<i32> {
+    let code = match args {
+        ["exec", prog, rest @ ..] => 100 + ulib::exec(prog, rest).0 as i32,
+        ["exec-keeps-pid"] => 100 + ulib::exec(NAME, &["pid-is", &format!("{}", ulib::getpid())]).0 as i32,
+        ["pid-is", pid] => (format!("{}", ulib::getpid()) != *pid) as i32,
+        ["exec-fd", cloexec] => {
+            let how = if *cloexec == "1" { flags::CLOSE_ON_SPAWN } else { 0 };
+            let Ok(fd) = fs::open("/dev/null", how) else { return Some(99) };
+            100 + ulib::exec(NAME, &["fd-open", &format!("{}", fd)]).0 as i32
+        }
+        ["hog-then-exec", mib] => {
+            let v = vec![1u8; mib.parse::<usize>().unwrap_or(0) << 20];
+            black_box(&v);
+            100 + ulib::exec(NAME, &["exit", "0"]).0 as i32
+        }
+        ["exec-handlers"] => {
+            handle(SIGUSR1, count);
+            let _ = ulib::signal::set_handler(SIGUSR2, Handler::Ignore);
+            100 + ulib::exec(NAME, &["sleep-forever"]).0 as i32
+        }
+        ["catch-self"] => {
+            handle(SIGUSR1, count);
+            raise(SIGUSR1); // runs before kill returns
+            (counted() != 1 || LAST.load(Ordering::Relaxed) != SIGUSR1 as u32) as i32
+        }
+        ["catch-many"] => {
+            handle(SIGUSR1, count);
+            for _ in 0..100 {
+                raise(SIGUSR1);
+            }
+            (counted() != 100) as i32
+        }
+        ["mask"] => {
+            handle(SIGUSR1, count);
+            ulib::signal::block(ulib::signal::bit(SIGUSR1));
+            raise(SIGUSR1);
+            let while_blocked = counted();
+            let old = ulib::signal::unblock(ulib::signal::bit(SIGUSR1));
+            let ok = while_blocked == 0 && counted() == 1 && old & ulib::signal::bit(SIGUSR1) != 0;
+            !ok as i32
+        }
+        ["ignore"] => {
+            let _ = ulib::signal::set_handler(SIGUSR1, Handler::Ignore);
+            raise(SIGUSR1);
+            raise(SIGCHLD); // ignored by default
+            0
+        }
+        // Signals arriving at any instruction (from the timer interrupt)
+        // must leave every register as it was, rcx and r11 included.
+        ["registers"] => {
+            handle(SIGUSR1, count_and_clobber);
+            handle(SIGUSR2, finish);
+            let (a, b) = (0x1111_2222_3333_4444u64, 0x5555_6666_7777_8888u64);
+            while !DONE.load(Ordering::Relaxed) {
+                let (rcx, r11, xmm): (u64, u64, u64);
+                unsafe {
+                    core::arch::asm!(
+                        "mov rcx, {a}", "mov r11, {b}", "movq xmm0, {b}",
+                        "2:", "dec {n}", "jnz 2b",
+                        "movq {x}, xmm0",
+                        a = in(reg) a, b = in(reg) b, n = inout(reg) 200_000u64 => _, x = out(reg) xmm,
+                        out("rcx") rcx, out("r11") r11, out("xmm0") _,
+                    );
+                }
+                if (rcx, r11, xmm) != (a, b, b) {
+                    return Some(1);
+                }
+            }
+            if counted() == 0 { 2 } else { 0 }
+        }
+        ["eintr"] => {
+            handle(SIGUSR1, count);
+            let mut buf = [0u8; 8];
+            let r = ulib::read(ulib::STDIN, &mut buf);
+            (r != Err(Errno::EINTR) || counted() != 1) as i32
+        }
+        ["suspend"] => {
+            handle(SIGUSR1, count);
+            ulib::signal::block(ulib::signal::bit(SIGUSR1));
+            ulib::signal::suspend(0);
+            let ok = counted() == 1 && ulib::signal::blocked() & ulib::signal::bit(SIGUSR1) != 0;
+            !ok as i32
+        }
+        ["segv-handler"] => {
+            handle(signal::SIGSEGV, exit_42);
+            unsafe { core::ptr::write_volatile(0xffff_ffff_8000_0000 as *mut u64, 0) };
+            0
+        }
+        ["skip-ud2"] => {
+            let _ = ulib::signal::set_handler(SIGILL, Handler::WithRegs(skip_ud2));
+            unsafe { core::arch::asm!("ud2") };
+            (counted() != 1) as i32
+        }
+        ["chld"] => {
+            handle(SIGCHLD, count);
+            let r = run_child(&["exit", "0"]);
+            (r != exited(0) || counted() != 1 || LAST.load(Ordering::Relaxed) != SIGCHLD as u32) as i32
+        }
+        ["bad-sigreturn"] => {
+            let mut frame = blank_frame();
+            frame.regs.rip = 0xffff_8000_0000_0000; // kernel space
+            frame.regs.rsp = 0x1000;
+            fake_sigreturn(&frame)
+        }
+        ["bad-mxcsr"] => {
+            // Every MXCSR bit set, reserved ones included: the kernel must
+            // drop those (a real CPU's fxrstor faults on them; QEMU's
+            // doesn't, hence the check on the value that arrives).
+            #[repr(C, align(16))]
+            struct Fx([u8; 512]);
+            let mut fx = Fx([0; 512]);
+            unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fx.0.as_mut_ptr()) };
+            fx.0[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+            let stack = Box::leak(vec![0u8; 16384].into_boxed_slice());
+            let mut frame = blank_frame();
+            frame.fpu = fx.0;
+            frame.regs.rip = exit_mxcsr_ok as *const () as u64;
+            frame.regs.rsp = ((stack.as_ptr() as u64 + 16384) & !0xf) - 8;
+            fake_sigreturn(&frame)
+        }
+        _ => return None,
+    };
+    Some(code)
+}
+
+fn exec(t: &mut Suite) {
+    let r = run_child(&["exec", NAME, "exit", "7"]);
+    check!(t, "exec runs the new program", r == exited(7), "{:?}", r);
+    let r = run_child(&["exec", NAME, "argcheck", "one", "two words", ""]);
+    check!(t, "exec passes arguments", r == exited(0), "{:?}", r);
+    let r = run_child(&["exec-keeps-pid"]);
+    check!(t, "exec keeps the pid", r == exited(0), "{:?}", r);
+    let r = run_child(&["exec", "no-such-program"]);
+    check!(t, "exec of a missing program fails and returns", r == exited(100 + Errno::ENOENT.0 as i32), "{:?}", r);
+    let r = run_child(&["exec-fd", "0"]);
+    check!(t, "exec keeps descriptors", r == exited(1), "{:?}", r);
+    let r = run_child(&["exec-fd", "1"]);
+    check!(t, "exec closes CLOSE_ON_SPAWN descriptors", r == exited(0), "{:?}", r);
+
+    // In this process: failures must leave it running as it was.
+    let r = ulib::exec("no-such-program", &[]);
+    check!(t, "failed exec returns ENOENT", r == Errno::ENOENT, "{:?}", r);
+    let not_elf = "/tmp/not-elf";
+    let r = write_file(not_elf, b"#!/bin/sh\necho hi\n").map(|_| ulib::exec(not_elf, &[]));
+    check!(t, "exec of a non-ELF file is ENOEXEC", r == Ok(Errno::ENOEXEC), "{:?}", r);
+    let _ = fs::unlink(not_elf);
+    let pairs = [[0u64; 2]; ulib::MAX_ARGS + 1];
+    let r = unsafe {
+        let name = NAME.as_ptr() as u64;
+        syscall6(sys::EXEC, name, NAME.len() as u64, pairs.as_ptr() as u64, pairs.len() as u64, 0, 0)
+    };
+    check!(t, "exec with too many arguments is E2BIG", r == -Errno::E2BIG.0, "got {}", r);
+
+    // Handlers don't survive exec; ignored signals stay ignored.
+    if let Ok(pid) = ulib::spawn(NAME, &["exec-handlers"]) {
+        ulib::sleep_ms(50);
+        let _ = ulib::kill(pid as i64, SIGUSR2);
+        ulib::sleep_ms(20);
+        let _ = ulib::kill(pid as i64, SIGUSR1);
+        let r = ulib::wait(pid);
+        check!(t, "exec resets handlers, keeps ignored signals", r == Ok(ExitStatus::Killed(SIGUSR1)), "{:?}", r);
+    }
+}
+
+fn handlers(t: &mut Suite) {
+    use ulib::signal::{bit, SIGKILL, SIGSTOP};
+    let r = run_child(&["catch-self"]);
+    check!(t, "a handler catches a signal", r == exited(0), "{:?}", r);
+    let r = run_child(&["catch-many"]);
+    check!(t, "100 signals, 100 handler calls", r == exited(0), "{:?}", r);
+    let r = run_child(&["mask"]);
+    check!(t, "a blocked signal waits until unblocked", r == exited(0), "{:?}", r);
+    let r = run_child(&["ignore"]);
+    check!(t, "ignored signals, and SIGCHLD by default, don't kill", r == exited(0), "{:?}", r);
+    let r = run_child(&["segv-handler"]);
+    check!(t, "a SIGSEGV handler runs on a fault", r == exited(42), "{:?}", r);
+    let r = run_child(&["skip-ud2"]);
+    check!(t, "a handler can change the registers it returns to", r == exited(0), "{:?}", r);
+    let r = run_child(&["chld"]);
+    check!(t, "SIGCHLD when a child exits", r == exited(0), "{:?}", r);
+    let r = run_child(&["bad-sigreturn"]);
+    check!(t, "sigreturn into the kernel is SIGSEGV", r == Ok(KILLED_SEGV), "{:?}", r);
+    let r = run_child(&["bad-mxcsr"]);
+    check!(t, "sigreturn clears reserved MXCSR bits", r == exited(0), "{:?}", r);
+
+    // Signals from another process, arriving at any instruction.
+    if let Ok(pid) = ulib::spawn(NAME, &["registers"]) {
+        for _ in 0..40 {
+            ulib::sleep_ms(3);
+            let _ = ulib::kill(pid as i64, SIGUSR1);
+        }
+        let _ = ulib::kill(pid as i64, SIGUSR2);
+        let r = ulib::wait(pid);
+        check!(t, "handlers preserve every register (rcx, r11, xmm0)", r == exited(0), "{:?}", r);
+    }
+    if let Ok((r_end, w_end)) = fs::pipe(flags::CLOSE_ON_SPAWN) {
+        let child = spawn_with(Some(r_end), None, &["eintr"]);
+        ulib::sleep_ms(30);
+        if let Ok(pid) = child {
+            let _ = ulib::kill(pid as i64, SIGUSR1);
+        }
+        let r = child.and_then(ulib::wait);
+        check!(t, "a handled signal makes a blocking read EINTR", r == exited(0), "{:?}", r);
+        let _ = fs::close(r_end);
+        let _ = fs::close(w_end);
+    }
+    if let Ok(pid) = ulib::spawn(NAME, &["suspend"]) {
+        ulib::sleep_ms(30);
+        let _ = ulib::kill(pid as i64, SIGUSR1);
+        let r = ulib::wait(pid);
+        check!(t, "sigsuspend waits for a handler, then restores the mask", r == exited(0), "{:?}", r);
+    }
+
+    // Errors, in this process.
+    let r = ulib::signal::set_handler(SIGKILL, Handler::Call(count));
+    check!(t, "SIGKILL can't be caught", matches!(r, Err(Errno::EINVAL)), "{:?}", r);
+    let r = ulib::signal::set_handler(SIGSTOP, Handler::Ignore);
+    check!(t, "SIGSTOP can't be ignored", matches!(r, Err(Errno::EINVAL)), "{:?}", r);
+    let r = ulib::signal::set_handler(32, Handler::Default);
+    check!(t, "sigaction of signal 32 is EINVAL", matches!(r, Err(Errno::EINVAL)), "{:?}", r);
+    let action = [count as *const () as u64, 0, 0, 0]; // no SA_RESTORER
+    let r = raw(sys::SIGACTION, SIGUSR1 as u64, action.as_ptr() as u64, 0);
+    check!(t, "a handler without a restorer is EINVAL", r == -Errno::EINVAL.0, "got {}", r);
+    let r = raw(sys::SIGACTION, SIGUSR1 as u64, BAD_PTR, 0);
+    check!(t, "sigaction from a bad pointer is EFAULT", r == -Errno::EFAULT.0, "got {}", r);
+    let set: u64 = 0;
+    let r = raw(sys::SIGPROCMASK, 7, &set as *const u64 as u64, 0);
+    check!(t, "sigprocmask with a bad operation is EINVAL", r == -Errno::EINVAL.0, "got {}", r);
+    let old = ulib::signal::set_blocked(u64::MAX);
+    let all = ulib::signal::blocked();
+    ulib::signal::set_blocked(old);
+    check!(t, "SIGKILL and SIGSTOP can't be blocked", all & (bit(SIGKILL) | bit(SIGSTOP)) == 0 && all & bit(SIGUSR1) != 0, "{:#x}", all);
 }

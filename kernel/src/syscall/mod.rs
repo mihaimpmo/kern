@@ -34,10 +34,17 @@
 //!   30 kill(pid, signal)        pid > 0 a process, < 0 a group, 0 our group
 //!   31 setpgid(pid, pgid)       32 set_foreground(pgid)   (Ctrl+C target)
 //!   33 time_ms() -> milliseconds since 1970 (UTC)
+//!   37 sigaction(sig, act: *const Action, old: *mut Action)   (signal.rs)
+//!   38 sigprocmask(how, set: *const u64, old: *mut u64)
+//!   39 sigreturn()               only from a handler's restorer
+//!   40 sigsuspend(mask) -> EINTR, once a signal has been handled
+//!
+//! Programs (process.rs):
+//!   36 exec(path, len, argv, argc)       replaces the program; no return
 //!
 //! Exit statuses (wait, try_wait) are the exit code in the low 32 bits, or
-//! 1 << 32 | signal for a process that was killed. Every signal kills; CPU
-//! faults in user mode raise SIGSEGV, SIGILL, SIGFPE, ...
+//! 1 << 32 | signal for a process that was killed. CPU faults in user mode
+//! raise SIGSEGV, SIGILL, SIGFPE, ...; see `task::signal` for what signals do.
 //!
 //! (9 was `programs`, replaced by reading /bin.) Strings are (pointer,
 //! length) pairs, never NUL-terminated; `argv` points to `argc` such pairs,
@@ -50,13 +57,16 @@
 mod file;
 mod memory;
 mod process;
+mod signal;
+
+pub use signal::deliver_from_interrupt;
 
 use crate::arch::cpu::{self, msr, rdmsr, wrmsr};
 use crate::arch::gdt;
 use crate::fs::FsError;
 use crate::mm::uspace::{MemError, UserSpace};
 use crate::mm::vmm;
-use crate::task::{self, exec::LoadError, signal, ExitStatus};
+use crate::task::{self, exec::LoadError, ExitStatus};
 use alloc::{string::String, vec, vec::Vec};
 use core::arch::global_asm;
 
@@ -132,6 +142,12 @@ impl From<LoadError> for Errno {
 
 type SysResult = Result<u64, Errno>;
 
+const SYS_SIGRETURN: u64 = 39;
+
+// The frame starts like an interrupt's (ss, rsp, rflags, cs, rip), so it can
+// return either way: `sysretq` normally, which takes rip and rflags from rcx
+// and r11, or `iretq` when every register must come back as saved (after
+// `sigreturn`, which resumes code interrupted at any instruction).
 global_asm!(
     r#"
 .section .text
@@ -140,10 +156,14 @@ syscall_entry:
     swapgs                         // GS -> per-CPU data
     mov gs:[8], rsp                // stash user rsp
     mov rsp, gs:[0]                // kernel stack of this task
+    push 0x1b                      // user ss
     push qword ptr gs:[8]          // user rsp
     push r11                       // user rflags
+    push 0x23                      // user cs
     push rcx                       // user rip
     push rax
+    push rcx
+    push r11
     push rdi
     push rsi
     push rdx
@@ -159,6 +179,7 @@ syscall_entry:
     mov rdi, rsp
     call syscall_dispatch
     cli
+    test al, al                    // pops leave the flags alone
     pop r15
     pop r14
     pop r13
@@ -171,12 +192,19 @@ syscall_entry:
     pop rdx
     pop rsi
     pop rdi
-    pop rax
-    pop rcx
     pop r11
+    pop rcx
+    pop rax
+    jnz 1f
+    pop rcx                        // rip
+    add rsp, 8                     // cs
+    pop r11                        // rflags
     pop rsp                        // back on the user stack
     swapgs
     sysretq
+1:
+    swapgs
+    iretq
 "#
 );
 
@@ -184,6 +212,7 @@ extern "C" {
     fn syscall_entry();
 }
 
+/// What `syscall_entry` pushes, lowest address first.
 #[repr(C)]
 pub struct SyscallFrame {
     r15: u64,
@@ -198,10 +227,14 @@ pub struct SyscallFrame {
     rdx: u64,
     rsi: u64,
     rdi: u64,
+    r11: u64,
+    rcx: u64,
     rax: u64,
     rip: u64,
+    cs: u64,
     rflags: u64,
     rsp: u64,
+    ss: u64,
 }
 
 /// Per CPU: the syscall MSRs are per-CPU registers.
@@ -222,11 +255,34 @@ pub fn init() {
     }
 }
 
+/// Returns true to go back to user mode through `iretq` (every register as
+/// in the frame) rather than `sysretq` (rcx and r11 clobbered).
 #[no_mangle]
-extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
+extern "C" fn syscall_dispatch(f: &mut SyscallFrame) -> bool {
     cpu::sti();
+    let iret = f.rax == SYS_SIGRETURN;
+    if iret {
+        signal::sigreturn(f);
+    } else {
+        f.rax = match call(f) {
+            Ok(value) => value,
+            Err(Errno(e)) => (-e) as u64,
+        };
+    }
+
+    signal::deliver_from_syscall(f);
+    // Returning to a non-canonical address would fault in ring 0. Handlers
+    // and sigreturn are checked already; this catches the rest.
+    if f.rip >= vmm::USER_END {
+        task::exit_current(ExitStatus::Killed(task::signal::SIGSEGV));
+    }
+    f.rflags = (f.rflags & !0x3000) | 0x200; // IOPL 0, interrupts on
+    iret
+}
+
+fn call(f: &mut SyscallFrame) -> SysResult {
     let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
-    let result: SysResult = match f.rax {
+    match f.rax {
         0 => task::exit_current(ExitStatus::Exited(a0 as i32)),
         1 => file::write(a0, a1, a2),
         2 => file::read(a0, a1, a2),
@@ -268,19 +324,12 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         33 => process::time_ms(),
         34 => file::rename(a0, a1, a2, a3),
         35 => file::statfs(a0, a1, a2),
+        36 => process::exec(f, a0, a1, a2, a3),
+        37 => signal::sigaction(a0, a1, a2),
+        38 => signal::sigprocmask(a0, a1, a2),
+        40 => signal::sigsuspend(a0),
         _ => Err(ENOSYS),
-    };
-    f.rax = match result {
-        Ok(value) => value,
-        Err(Errno(e)) => (-e) as u64,
-    };
-
-    // sysret to a non-canonical address would fault in ring 0.
-    if f.rip >= vmm::USER_END {
-        task::exit_current(ExitStatus::Killed(signal::SIGSEGV));
     }
-    task::deliver_signals();
-    f.rflags = (f.rflags & !0x3000) | 0x200; // IOPL 0, interrupts on
 }
 
 // ------------------------------------------------------------ user memory

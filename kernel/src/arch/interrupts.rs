@@ -135,10 +135,10 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         }
     }
     // About to return to user mode: act on signals sent meanwhile (from
-    // another CPU, Ctrl+C, ...). This is what stops a process that never
-    // makes a system call.
+    // another CPU, Ctrl+C, a fault just now, ...). This is what stops a
+    // process that never makes a system call.
     if frame.from_user() {
-        task::deliver_signals();
+        crate::syscall::deliver_from_interrupt(frame);
     }
 }
 
@@ -185,7 +185,13 @@ fn exception(frame: &mut InterruptFrame) {
                 FaultResult::Denied => {}
             }
         }
-        // A user program faulted: kill it, the rest of the system keeps running.
+        // A user program faulted. If it has a handler for the signal, that
+        // runs on the way back; otherwise the process ends, and the rest of
+        // the system keeps running.
+        let sig = fault_signal(frame.vector);
+        if !out_of_memory && task::raise_fault(sig) {
+            return;
+        }
         let pid = task::current_pid();
         if out_of_memory {
             kprintln!("\x1b[91m[kernel] process {} killed: out of memory at {:#x}\x1b[0m", pid, cr2);
@@ -197,7 +203,7 @@ fn exception(frame: &mut InterruptFrame) {
         } else {
             kprintln!("\x1b[91m[kernel] process {} killed: {} at {:#x}\x1b[0m", pid, name, frame.rip);
         }
-        task::exit_current(ExitStatus::Killed(fault_signal(frame.vector)));
+        task::exit_current(ExitStatus::Killed(sig));
     }
 
     if frame.vector == 14 {

@@ -50,6 +50,28 @@ impl FpuState {
         Box::new(unsafe { (*INITIAL.as_ptr()).clone() })
     }
 
+    /// The registers as they are now on this CPU, as bytes.
+    pub fn capture() -> [u8; 512] {
+        let mut state = FpuState([0; 512]);
+        state.save();
+        state.0
+    }
+
+    /// Load `bytes` (an `fxsave` image from user space) into this CPU's
+    /// registers. MXCSR bits the CPU doesn't support are cleared first:
+    /// `fxrstor` would fault on them.
+    pub fn load_user(bytes: &[u8; 512]) {
+        let mut state = FpuState(*bytes);
+        let initial: &FpuState = unsafe { &*INITIAL.as_ptr() };
+        let mask = match u32::from_le_bytes(initial.0[28..32].try_into().unwrap()) {
+            0 => 0xffbf, // the default when the CPU doesn't report one
+            m => m,
+        };
+        let mxcsr = u32::from_le_bytes(state.0[24..28].try_into().unwrap()) & mask;
+        state.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        state.restore();
+    }
+
     pub fn save(&mut self) {
         unsafe { asm!("fxsave64 [{}]", in(reg) self.0.as_mut_ptr(), options(nostack, preserves_flags)) };
     }

@@ -16,6 +16,7 @@
 
 mod elf;
 pub mod exec;
+pub mod signal;
 
 use crate::arch::fpu::FpuState;
 use crate::arch::{cpu, percpu};
@@ -59,22 +60,6 @@ impl ExitStatus {
     }
 }
 
-/// Signal numbers (Linux's). There are no handlers: every signal ends the
-/// process. The kernel raises only some of them itself; the rest are listed
-/// because user space sends them.
-#[allow(dead_code)]
-pub mod signal {
-    pub const SIGILL: u8 = 4;
-    pub const SIGTRAP: u8 = 5;
-    pub const SIGBUS: u8 = 7;
-    pub const SIGFPE: u8 = 8;
-    pub const SIGKILL: u8 = 9;
-    pub const SIGSEGV: u8 = 11;
-    pub const SIGINT: u8 = 2;
-    pub const SIGTERM: u8 = 15;
-    pub const MAX: u8 = 31;
-}
-
 pub struct Task {
     pub pid: Pid,
     pub name: String,
@@ -83,8 +68,8 @@ pub struct Task {
     /// CPU the task is running on, while `state == Running`.
     pub cpu: Option<usize>,
     exit: ExitStatus,
-    /// A signal sent to the task and not yet acted on.
-    pending_signal: Option<u8>,
+    /// Pending and blocked signals, and their actions.
+    signals: signal::Signals,
     rsp: u64,
     kstack: Option<KernelStack>,
     /// What the user process owns (None for kernel threads). Locked
@@ -108,7 +93,7 @@ impl Task {
             parent,
             cpu: None,
             exit: ExitStatus::Exited(0),
-            pending_signal: None,
+            signals: signal::Signals::new(),
             rsp: 0,
             kstack: None,
             process: None,
@@ -370,11 +355,54 @@ impl core::fmt::Display for SpawnError {
 /// Start the program at `path`, resolved against `inherit.cwd`. A bare name
 /// (no '/') means /bin/<name>. The task is named after the last component.
 pub fn spawn_program(path: &str, args: &[&[u8]], parent: Option<Pid>, inherit: Inherit) -> Result<Pid, SpawnError> {
+    let (name, image) = read_program(&inherit.cwd, path)?;
+    spawn_user(&name, &image, args, parent, inherit).map_err(SpawnError::Load)
+}
+
+/// The executable at `path` (a bare name means /bin/<name>), and the name
+/// its task goes by: the last path component.
+fn read_program(cwd: &str, path: &str) -> Result<(String, Vec<u8>), SpawnError> {
     let full = if path.contains('/') { String::from(path) } else { alloc::format!("/bin/{}", path) };
-    let inode = crate::fs::lookup(&inherit.cwd, &full).map_err(SpawnError::Fs)?;
+    let inode = crate::fs::lookup(cwd, &full).map_err(SpawnError::Fs)?;
     let image = crate::fs::read_file(&inode).map_err(SpawnError::Fs)?;
-    let name = full.rsplit('/').next().unwrap_or(&full);
-    spawn_user(name, &image, args, parent, inherit).map_err(SpawnError::Load)
+    let name = String::from(full.rsplit('/').next().unwrap_or(&full));
+    Ok((name, image))
+}
+
+/// Replace the calling process's program with the one at `path`. The
+/// process keeps its pid, parent, process group, working directory and
+/// file descriptors, except those marked close-on-spawn (O_CLOEXEC), which
+/// are closed. Handlers go back to the default action. Returns the entry
+/// point and stack pointer to return to user mode with; on an error the
+/// old program carries on unchanged.
+pub fn exec_current(path: &str, args: &[&[u8]]) -> Result<(u64, u64), SpawnError> {
+    let process = current_process().expect("exec from a kernel thread");
+    let cwd = process.cwd.lock().clone();
+    let (name, data) = read_program(&cwd, path)?;
+    let image = exec::load(&data, args).map_err(SpawnError::Load)?;
+    drop(data);
+    let fpu = FpuState::new();
+
+    // The point of no return. Until CR3 is switched below, the task keeps
+    // running on the old page tables, which stay alive in `old`.
+    let pml4 = image.space.pml4();
+    let old = core::mem::replace(&mut *process.space.lock(), image.space);
+    let closing = process.files.lock().take_close_on_spawn();
+    {
+        let mut s = SCHED.lock();
+        let t = s.current();
+        t.pml4 = pml4;
+        unsafe { cpu::write_cr3(pml4) };
+        t.name = name;
+        t.signals.reset_for_exec();
+        // The live registers are the task's (the kernel never uses them).
+        fpu.restore();
+        t.fpu = Some(fpu);
+    }
+    drop(process);
+    drop(old); // frees the old program's memory, now that nothing uses it
+    drop(closing); // closing can wake other tasks: no locks held
+    Ok((image.entry, image.stack))
 }
 
 fn user_task_entry(_: u64) {
@@ -421,7 +449,11 @@ pub fn exit_current(status: ExitStatus) -> ! {
     let t = s.current();
     t.state = State::Zombie;
     t.exit = status;
+    let parent = t.parent;
     s.zombies.push(pid);
+    if let Some(parent) = parent {
+        post_locked(&mut s, parent, signal::SIGCHLD);
+    }
     CHILD_EXITED.wake_all_locked(&mut s);
     schedule(&mut s);
     unreachable!("zombie task was scheduled");
@@ -448,7 +480,7 @@ pub fn wait(pid: Pid) -> Result<ExitStatus, WaitError> {
             collect(&mut s, pid);
             return Ok(status);
         }
-        if s.current().pending_signal.is_some() {
+        if s.current().signals.deliverable() != 0 {
             return Err(WaitError::Interrupted);
         }
         CHILD_EXITED.block_locked(&mut s);
@@ -484,9 +516,10 @@ pub enum KillTarget {
     Group(Pid),
 }
 
-/// Send `signal` to a process or a process group. The target dies the next
-/// time it would return to user mode; a sleeping or blocked target is woken
-/// so that happens soon.
+/// Send `signal` to a process or a process group. The target acts on it the
+/// next time it would return to user mode (see `signal`); a sleeping or
+/// blocked target is woken so that happens soon, unless it blocks or ignores
+/// the signal.
 pub fn kill(target: KillTarget, sig: u8) -> Result<(), KillError> {
     let mut s = SCHED.lock();
     let matches = |t: &Task| match target {
@@ -499,14 +532,22 @@ pub fn kill(target: KillTarget, sig: u8) -> Result<(), KillError> {
     }
     let mut sent = false;
     for pid in victims.into_iter().filter(|&p| p != 1) {
-        let t = s.tasks.get_mut(&pid).unwrap();
-        t.pending_signal.get_or_insert(sig);
+        post_locked(&mut s, pid, sig);
         sent = true;
-        if matches!(t.state, State::Blocked | State::Sleeping) {
-            s.make_ready(pid);
-        }
     }
     if sent { Ok(()) } else { Err(KillError::NotFound) }
+}
+
+/// Post `sig` to task `pid` (if it is a live user task), waking it if it
+/// sleeps or blocks and can act on the signal now.
+fn post_locked(s: &mut Scheduler, pid: Pid, sig: u8) {
+    let Some(t) = s.tasks.get_mut(&pid) else { return };
+    if t.state == State::Zombie || t.process.is_none() {
+        return;
+    }
+    if t.signals.post(sig) && matches!(t.state, State::Blocked | State::Sleeping) {
+        s.make_ready(pid);
+    }
 }
 
 /// Put process `pid` in group `pgid`. Only the caller and its children can
@@ -522,11 +563,41 @@ pub fn set_process_group(pid: Pid, pgid: Pid) -> Result<(), KillError> {
     Ok(())
 }
 
-/// On the way back to user mode: if a signal is pending, die of it.
-pub fn deliver_signals() {
-    let pending = SCHED.lock().current().pending_signal;
-    if let Some(sig) = pending {
-        exit_current(ExitStatus::Killed(sig));
+/// Run `f` on the calling task's signal state, under the scheduler lock.
+/// `f` must not take other locks or print.
+pub fn with_signals<R>(f: impl FnOnce(&mut signal::Signals) -> R) -> R {
+    f(&mut SCHED.lock().current().signals)
+}
+
+/// On the way back to user mode: the next signal to act on, if any. A
+/// signal whose action is to end the process does so here.
+pub fn next_signal() -> Option<(u8, signal::Action, u64)> {
+    let next = with_signals(|s| s.next());
+    match next? {
+        signal::Disposition::Terminate(sig) => exit_current(ExitStatus::Killed(sig)),
+        signal::Disposition::Handle { sig, action, restore_mask } => Some((sig, action, restore_mask)),
+    }
+}
+
+/// A CPU fault in user mode raised `sig`. If the process has a handler for
+/// it that isn't blocked, post it (the handler runs on the way back to user
+/// mode) and return true; otherwise the caller ends the process.
+pub fn raise_fault(sig: u8) -> bool {
+    with_signals(|s| s.fault_is_caught(sig) && {
+        s.post(sig);
+        true
+    })
+}
+
+/// Sleep with `mask` as the signal mask until a signal arrives that can be
+/// acted on. The old mask comes back once that signal's handler returns.
+pub fn sigsuspend(mask: u64) {
+    with_signals(|s| {
+        s.saved_mask = Some(s.blocked());
+        s.set_blocked(mask);
+    });
+    while with_signals(|s| s.deliverable()) == 0 {
+        sleep_ms(u64::MAX); // returns early for a signal
     }
 }
 
@@ -664,7 +735,7 @@ pub fn yield_now() {
 pub fn sleep_ms(ms: u64) {
     let mut s = SCHED.lock();
     let t = s.current();
-    if t.pending_signal.is_some() {
+    if t.signals.deliverable() != 0 {
         return;
     }
     t.wake_at = uptime_ms().saturating_add(ms.max(1));
@@ -746,14 +817,14 @@ impl WaitQueue {
     /// returning with the lock released.
     pub fn wait_interruptible<'a, T>(&self, guard: SpinLockGuard<'a, T>) -> Result<SpinLockGuard<'a, T>, Interrupted> {
         let mut s = SCHED.lock();
-        if s.current().pending_signal.is_some() {
+        if s.current().signals.deliverable() != 0 {
             drop(s);
             return Err(Interrupted);
         }
         self.enqueue_current(&mut s);
         let (lock, irq) = guard.release();
         schedule(&mut s);
-        let interrupted = s.current().pending_signal.is_some();
+        let interrupted = s.current().signals.deliverable() != 0;
         drop(s);
         if interrupted {
             return Err(Interrupted); // `irq` restores the interrupt state

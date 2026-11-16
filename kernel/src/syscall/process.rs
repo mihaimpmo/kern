@@ -1,6 +1,6 @@
-//! Process system calls: spawn, wait, and process information.
+//! Process system calls: spawn, exec, wait, and process information.
 
-use super::{check_user, copy_from_user, copy_out, copy_to_user, user_bytes, user_path, Errno, SysResult};
+use super::{check_user, copy_from_user, copy_out, copy_to_user, user_bytes, user_path, Errno, SysResult, SyscallFrame};
 use super::{E2BIG, ECHILD, EFAULT, EINTR, EINVAL, EPERM, ESRCH};
 use crate::arch::smp;
 use crate::drivers::{keyboard, rtc};
@@ -23,17 +23,7 @@ impl From<SpawnError> for Errno {
 /// arguments; it inherits our file descriptors and working directory.
 pub fn spawn(path: u64, path_len: u64, argv: u64, argc: u64) -> SysResult {
     let path = user_path(path, path_len)?;
-    if argc > exec::MAX_ARGS as u64 {
-        return Err(E2BIG);
-    }
-    let mut pairs = vec![0u8; argc as usize * 16];
-    copy_from_user(&mut pairs, argv)?;
-    let mut args = Vec::with_capacity(argc as usize);
-    for pair in pairs.chunks_exact(16) {
-        let ptr = u64::from_le_bytes(pair[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(pair[8..].try_into().unwrap());
-        args.push(user_bytes(ptr, len, exec::MAX_ARG_BYTES, E2BIG)?);
-    }
+    let args = user_args(argv, argc)?;
     let args: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
 
     let me = task::current_process().ok_or(EFAULT)?;
@@ -51,6 +41,45 @@ pub fn spawn(path: u64, path_len: u64, argv: u64, argc: u64) -> SysResult {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// `argc` (pointer, length) pairs at `argv`, copied in.
+fn user_args(argv: u64, argc: u64) -> Result<Vec<Vec<u8>>, Errno> {
+    if argc > exec::MAX_ARGS as u64 {
+        return Err(E2BIG);
+    }
+    let mut pairs = vec![0u8; argc as usize * 16];
+    copy_from_user(&mut pairs, argv)?;
+    let mut args = Vec::with_capacity(argc as usize);
+    for pair in pairs.chunks_exact(16) {
+        let ptr = u64::from_le_bytes(pair[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(pair[8..].try_into().unwrap());
+        args.push(user_bytes(ptr, len, exec::MAX_ARG_BYTES, E2BIG)?);
+    }
+    Ok(args)
+}
+
+/// Replace our program with the one at `path` (resolved like `spawn`'s).
+/// On success the system call "returns" into the new program's entry point,
+/// with every register zeroed; on failure the old program gets the error.
+pub fn exec(f: &mut SyscallFrame, path: u64, path_len: u64, argv: u64, argc: u64) -> SysResult {
+    let path = user_path(path, path_len)?;
+    let args = user_args(argv, argc)?;
+    let args: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+    let (entry, stack) = match task::exec_current(&path, &args) {
+        Ok(start) => start,
+        Err(e @ SpawnError::Load(why)) => {
+            kprintln!("\x1b[91m[kernel] cannot exec {}: {}\x1b[0m", path, why);
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    *f = SyscallFrame {
+        r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r9: 0, r8: 0, r10: 0, rdx: 0, rsi: 0, rdi: 0,
+        r11: 0, rcx: 0, rax: 0,
+        rip: entry, cs: f.cs, rflags: 0x202, rsp: stack, ss: f.ss,
+    };
+    Ok(0)
 }
 
 pub fn wait(pid: u64, code_ptr: u64) -> SysResult {

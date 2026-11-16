@@ -28,6 +28,8 @@ builtins:
   uptime              time since boot
   history             recent commands (Up/Down recall them)
   clear               clear the screen
+  exec cmd args       replace the shell with a program (for pid 1, the
+                      system stops when that program ends)
 programs (in /bin; try `ls /bin`):
   echo, cat, ls, mkdir, rm, mv, wc, df, ps, kill, sleep, date, hello, spin, crash, selftest
 running:
@@ -292,7 +294,7 @@ fn run(p: &Pipeline, history: &[String]) {
 }
 
 fn is_builtin(word: &str) -> bool {
-    matches!(word, "help" | "cd" | "pwd" | "mem" | "uptime" | "history" | "clear" | "init")
+    matches!(word, "help" | "cd" | "pwd" | "mem" | "uptime" | "history" | "clear" | "init" | "exec")
 }
 
 fn builtin(words: &[&str], history: &[String]) {
@@ -331,6 +333,10 @@ fn builtin(words: &[&str], history: &[String]) {
             }
         }
         "init" => println!("init is already running"),
+        "exec" => match args.split_first() {
+            Some((program, rest)) => println!("exec: {}: {}", program, ulib::exec(program, rest)),
+            None => println!("usage: exec <program> [args...]"),
+        },
         other => println!("{}: not a builtin", other),
     }
 }

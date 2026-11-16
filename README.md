@@ -45,8 +45,8 @@ kern:/> ls /bin | wc -l
 | Files | VFS with an in-memory root (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection, rename |
 | Storage | PCI enumeration, NVMe driver, write-through block cache; **KFS**, Kern's own on-disk filesystem, mounted at `/disk` |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
-| Syscalls | 35: processes (spawn with argv, wait, kill, process groups), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, rename, chdir, dup2, pipe, statfs, ...), time |
-| Signals | `kill`, process groups, Ctrl+C interrupts the foreground job; CPU faults kill with SIGSEGV/SIGILL/SIGFPE |
+| Syscalls | 40: processes (spawn with argv, exec, wait, kill, process groups), signals (sigaction, sigprocmask, sigsuspend), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, rename, chdir, dup2, pipe, statfs, ...), time |
+| Signals | Handlers on the user stack (Linux-style `sigaction`, `sigreturn`), blocking masks, `sigsuspend`, SIGCHLD; `kill`, process groups, Ctrl+C interrupts the foreground job; CPU faults raise SIGSEGV/SIGILL/SIGFPE, which a handler can catch |
 | Pipes | 64 KiB pipes with EOF and EPIPE, close-on-spawn descriptors |
 | Clock | Date and time from the CMOS real-time clock |
 | Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, buffered serial port |
@@ -157,7 +157,7 @@ Nothing is written to the internal disk. The kernel does drive NVMe SSDs, but it
 1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 3. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.
-4. **`exec`, signal handlers, threads**, then a real libc port.
+4. **Threads** (they need the TLB shootdown from step 1), then a real libc port.
 5. **USB:** xHCI + HID keyboard.
 6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
 

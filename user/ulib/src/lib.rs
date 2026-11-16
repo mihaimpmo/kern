@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod fs;
 pub mod heap;
+pub mod signal;
 pub mod time;
 
 use core::arch::{asm, global_asm};
@@ -54,6 +55,11 @@ pub mod sys {
     pub const TIME_MS: u64 = 33;
     pub const RENAME: u64 = 34;
     pub const STATFS: u64 = 35;
+    pub const EXEC: u64 = 36;
+    pub const SIGACTION: u64 = 37;
+    pub const SIGPROCMASK: u64 = 38;
+    pub const SIGRETURN: u64 = 39;
+    pub const SIGSUSPEND: u64 = 40;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -178,6 +184,20 @@ pub const MAX_ARGS: usize = 64;
 /// its `argv[1..]`; `argv[0]` is `name`. The child inherits our file
 /// descriptors and working directory. Returns its pid.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, Errno> {
+    start(sys::SPAWN, name, args)
+}
+
+/// Replace this program with another, found like `spawn`'s, keeping the
+/// pid and file descriptors (except those opened with `CLOSE_ON_SPAWN`).
+/// Signal handlers go back to the default action. Returns only on failure.
+pub fn exec(name: &str, args: &[&str]) -> Errno {
+    match start(sys::EXEC, name, args) {
+        Ok(_) => unreachable!("exec returned"),
+        Err(e) => e,
+    }
+}
+
+fn start(call: u64, name: &str, args: &[&str]) -> Result<u64, Errno> {
     if args.len() + 1 > MAX_ARGS {
         return Err(Errno::E2BIG);
     }
@@ -186,10 +206,7 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, Errno> {
         *pair = [arg.as_ptr() as u64, arg.len() as u64];
     }
     let argc = args.len() as u64 + 1;
-    let ret = unsafe {
-        syscall6(sys::SPAWN, name.as_ptr() as u64, name.len() as u64, pairs.as_ptr() as u64, argc, 0, 0)
-    };
-    check(ret)
+    check(unsafe { syscall6(call, name.as_ptr() as u64, name.len() as u64, pairs.as_ptr() as u64, argc, 0, 0) })
 }
 
 /// How a process ended.
@@ -235,41 +252,6 @@ pub fn try_wait() -> Option<(Pid, ExitStatus)> {
     let mut raw: u64 = 0;
     let pid = unsafe { syscall(sys::TRY_WAIT, &mut raw as *mut u64 as u64, 0, 0) };
     (pid > 0).then(|| (pid as Pid, ExitStatus::decode(raw)))
-}
-
-/// Signals (Linux numbers). Every signal kills the process it is sent to.
-pub mod signal {
-    pub const SIGINT: u8 = 2;
-    pub const SIGILL: u8 = 4;
-    pub const SIGTRAP: u8 = 5;
-    pub const SIGBUS: u8 = 7;
-    pub const SIGFPE: u8 = 8;
-    pub const SIGKILL: u8 = 9;
-    pub const SIGSEGV: u8 = 11;
-    pub const SIGTERM: u8 = 15;
-
-    pub fn name(sig: u8) -> &'static str {
-        match sig {
-            SIGINT => "SIGINT",
-            SIGILL => "SIGILL",
-            SIGTRAP => "SIGTRAP",
-            SIGBUS => "SIGBUS",
-            SIGFPE => "SIGFPE",
-            SIGKILL => "SIGKILL",
-            SIGSEGV => "SIGSEGV",
-            SIGTERM => "SIGTERM",
-            _ => "a signal",
-        }
-    }
-
-    /// "INT", "SIGINT" or "2" -> 2.
-    pub fn parse(s: &str) -> Option<u8> {
-        if let Ok(n) = s.parse::<u8>() {
-            return (1..=31).contains(&n).then_some(n);
-        }
-        let s = s.strip_prefix("SIG").unwrap_or(s);
-        [SIGINT, SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGTERM].into_iter().find(|&n| &name(n)[3..] == s)
-    }
 }
 
 /// Send `sig` to process `pid` (> 0), process group `-pid` (< 0), or our

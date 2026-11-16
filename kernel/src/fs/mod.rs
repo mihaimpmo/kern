@@ -289,8 +289,8 @@ pub mod flags {
     pub const TRUNCATE: u64 = 0x200;
     pub const APPEND: u64 = 0x400;
     pub const DIRECTORY: u64 = 0x1_0000;
-    /// O_CLOEXEC: don't pass the descriptor on to spawned children (also
-    /// accepted by `pipe`).
+    /// O_CLOEXEC: don't pass the descriptor on to spawned children, and
+    /// close it on `exec` (also accepted by `pipe`).
     pub const CLOSE_ON_SPAWN: u64 = 0x8_0000;
 }
 
@@ -399,7 +399,7 @@ pub struct FdTable {
 
 struct Slot {
     file: Arc<OpenFile>,
-    /// Not passed on to spawned children (O_CLOEXEC).
+    /// Not passed on to spawned children, closed by exec (O_CLOEXEC).
     close_on_spawn: bool,
 }
 
@@ -466,6 +466,18 @@ impl FdTable {
             Some(slot) => Ok(slot.file),
             None => Err(FsError::BadFd),
         }
+    }
+
+    /// Take out the files marked close-on-spawn, which a process doesn't
+    /// keep across `exec` either, to be dropped by the caller.
+    pub fn take_close_on_spawn(&mut self) -> Vec<Arc<OpenFile>> {
+        let mut taken = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if slot.as_ref().map_or(false, |s| s.close_on_spawn) {
+                taken.push(slot.take().unwrap().file);
+            }
+        }
+        taken
     }
 
     /// Take every open file out, to be dropped by the caller.

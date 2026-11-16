@@ -136,6 +136,7 @@ SHELL_STEPS = [
     ("<up><up>", r"kern:/> crash$"),        # history recall redraws the line
     ("", r"killed by SIGSEGV"),              # ...and Enter runs it again
     ("history", r"^\s+\d+\s+no-such-thing$"),
+    ("exec no-such-thing", r"exec: no-such-thing: no such file or directory"),
     ("hello 1 &", r"\[\d+\] started in background"),
     ("ps", r"PID\s+PPID\s+STATE\s+CPU\s+NAME"),
     ("echo esc<esc>ok", r"^escok$"),         # a lone Esc doesn't eat keys
