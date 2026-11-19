@@ -168,7 +168,9 @@ SHELL_STEPS = [
     ("spin | wc -l", r"> spin \| wc -l$"),
     (PAUSE, None),
     ("<ctrl-c>", r"^\^C$"),                 # every process in the pipeline
-    ("ps | wc -l", r"^4$"),                  # header, init, ps, wc: nothing left over
+    # Header, init, ps, and wc if it has started by the time ps lists the
+    # tasks (ps may run at once on another CPU): no spin left over.
+    ("ps | wc -l", r"^[34]$"),
     # The disk.
     ("echo kept on disk > /disk/note", PROMPT),
     ("cat /disk/note", r"^kept on disk$"),

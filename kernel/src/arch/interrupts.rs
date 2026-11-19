@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const VECTOR_TIMER: u64 = 0x20;
 pub const VECTOR_KEYBOARD: u64 = 0x21;
 pub const VECTOR_TLB_SHOOTDOWN: u64 = 0xF0;
+pub const VECTOR_RESCHEDULE: u64 = 0xF1;
 pub const VECTOR_LEGACY_PIC_BASE: u64 = 0xE0; // masked 8259 PIC, remapped out of the way
 pub const VECTOR_SPURIOUS: u64 = 0xFF;
 
@@ -143,6 +144,10 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         VECTOR_TLB_SHOOTDOWN => {
             super::tlb::handle_ipi();
             apic::eoi();
+        }
+        VECTOR_RESCHEDULE => {
+            apic::eoi();
+            task::reschedule_ipi();
         }
         VECTOR_SPURIOUS => {} // spurious: no EOI
         v if (VECTOR_LEGACY_PIC_BASE..VECTOR_LEGACY_PIC_BASE + 16).contains(&v) => {} // stray 8259 IRQ

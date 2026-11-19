@@ -4,7 +4,14 @@
 //! Switching tasks = saving callee-saved registers on the old kernel stack,
 //! swapping stack pointers, and popping them from the new one. Each CPU has
 //! an idle task (pid 0, not in the task table) that runs when nothing else
-//! is ready; ready tasks wait in one queue that every CPU takes work from.
+//! is ready.
+//!
+//! Each CPU has its own ready queue. A task that becomes ready goes back to
+//! the CPU it last ran on, whose caches may still hold its data, unless that
+//! CPU is busy and another one is idle; an idle CPU is woken with an IPI so
+//! it doesn't wait for its next timer tick. A CPU with nothing queued takes
+//! work from the longest other queue. (The queues are still all behind the
+//! one scheduler lock.)
 //!
 //! Locking: all scheduler state lives in `SCHED`, and the lock is held
 //! across `switch_context`. The task switching away takes it; the task that
@@ -19,7 +26,8 @@ pub mod exec;
 pub mod signal;
 
 use crate::arch::fpu::FpuState;
-use crate::arch::{cpu, percpu};
+use crate::arch::interrupts::VECTOR_RESCHEDULE;
+use crate::arch::{apic, cpu, percpu, smp};
 use crate::fs::FdTable;
 use crate::mm::uspace::{FaultResult, UserSpace};
 use crate::mm::{kstack::KernelStack, vmm};
@@ -67,6 +75,8 @@ pub struct Task {
     pub parent: Option<Pid>,
     /// CPU the task is running on, while `state == Running`.
     pub cpu: Option<usize>,
+    /// CPU it ran on last (or was started from): where it queues up.
+    last_cpu: usize,
     exit: ExitStatus,
     /// Pending and blocked signals, and their actions.
     signals: signal::Signals,
@@ -92,6 +102,7 @@ impl Task {
             state: State::Ready,
             parent,
             cpu: None,
+            last_cpu: 0,
             exit: ExitStatus::Exited(0),
             signals: signal::Signals::new(),
             rsp: 0,
@@ -131,11 +142,20 @@ struct Cpu {
     current: *mut Task,
     idle: Box<Task>,
     slice: u32,
+    /// Tasks waiting to run here.
+    ready: VecDeque<Pid>,
+    /// An IPI is on its way here and the CPU hasn't scheduled since.
+    kicked: bool,
+}
+
+impl Cpu {
+    fn is_idle(&self) -> bool {
+        core::ptr::eq(self.current, &*self.idle)
+    }
 }
 
 struct Scheduler {
     tasks: BTreeMap<Pid, Box<Task>>,
-    ready: VecDeque<Pid>,
     sleeping: Vec<Pid>,
     zombies: Vec<Pid>, // exited, resources not yet freed
     cpus: Vec<Cpu>,    // indexed by percpu::index()
@@ -147,7 +167,6 @@ unsafe impl Send for Scheduler {}
 
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     tasks: BTreeMap::new(),
-    ready: VecDeque::new(),
     sleeping: Vec::new(),
     zombies: Vec::new(),
     cpus: Vec::new(),
@@ -169,10 +188,44 @@ impl Scheduler {
     }
 
     fn make_ready(&mut self, pid: Pid) {
-        if let Some(t) = self.tasks.get_mut(&pid) {
-            t.state = State::Ready;
-            self.ready.push_back(pid);
+        let Some(t) = self.tasks.get_mut(&pid) else { return };
+        t.state = State::Ready;
+        let last = t.last_cpu;
+        // Stay put unless the CPU is busy and another one has nothing to do.
+        let target = if self.cpus[last].is_idle() && self.cpus[last].ready.is_empty() {
+            last
+        } else {
+            (0..self.cpus.len()).find(|&c| self.cpus[c].is_idle() && self.cpus[c].ready.is_empty()).unwrap_or(last)
+        };
+        self.cpus[target].ready.push_back(pid);
+        if self.cpus[target].is_idle() {
+            self.kick(target);
         }
+    }
+
+    /// Interrupt CPU `index` (unless it's this one, or already on its way)
+    /// so it reschedules, or notices a signal, now.
+    fn kick(&mut self, index: usize) {
+        if index == percpu::index() || self.cpus[index].kicked {
+            return;
+        }
+        self.cpus[index].kicked = true;
+        apic::send_ipi(smp::lapic_id_of(index), VECTOR_RESCHEDULE as u8);
+    }
+
+    /// Whether any CPU has a task waiting.
+    fn any_ready(&self) -> bool {
+        self.cpus.iter().any(|c| !c.ready.is_empty())
+    }
+
+    /// The next task for CPU `index`: from its own queue, or else the front
+    /// of the longest other queue.
+    fn pop_ready(&mut self, index: usize) -> Option<Pid> {
+        if let Some(pid) = self.cpus[index].ready.pop_front() {
+            return Some(pid);
+        }
+        let busiest = (0..self.cpus.len()).max_by_key(|&c| self.cpus[c].ready.len())?;
+        self.cpus[busiest].ready.pop_front()
     }
 }
 
@@ -283,7 +336,7 @@ pub fn add_cpu() {
     idle.state = State::Running;
     idle.cpu = Some(percpu::index());
     let current: *mut Task = &mut *idle;
-    s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS });
+    s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS, ready: VecDeque::new(), kicked: false });
 }
 
 fn add_task(name: &str, parent: Option<Pid>, process: Option<Process>, entry: fn(u64), arg: u64) -> Option<Pid> {
@@ -293,6 +346,7 @@ fn add_task(name: &str, parent: Option<Pid>, process: Option<Process>, entry: fn
     let pid = s.next_pid;
     s.next_pid += 1;
     let mut task = Box::new(Task::new(pid, name, parent));
+    task.last_cpu = percpu::index(); // start near the parent
     task.rsp = rsp;
     task.kstack = Some(kstack);
     if let Some(process) = process {
@@ -545,8 +599,15 @@ fn post_locked(s: &mut Scheduler, pid: Pid, sig: u8) {
     if t.state == State::Zombie || t.process.is_none() {
         return;
     }
-    if t.signals.post(sig) && matches!(t.state, State::Blocked | State::Sleeping) {
-        s.make_ready(pid);
+    if !t.signals.post(sig) {
+        return;
+    }
+    match (t.state, t.cpu) {
+        (State::Blocked | State::Sleeping, _) => s.make_ready(pid),
+        // Running elsewhere: interrupt it, so it acts on the signal on its
+        // way back to user mode instead of at its next timer tick.
+        (State::Running, Some(cpu)) => s.kick(cpu),
+        _ => {}
     }
 }
 
@@ -649,8 +710,9 @@ fn schedule(s: &mut SchedGuard) {
     let prev_running = prev.state == State::Running;
     let prev_idle = core::ptr::eq(prev_ptr, &*s.cpus[index].idle);
 
+    s.cpus[index].kicked = false;
     let next_ptr: *mut Task = loop {
-        match s.ready.pop_front() {
+        match s.pop_ready(index) {
             Some(pid) => match s.tasks.get_mut(&pid) {
                 Some(t) if t.state == State::Ready => break &mut **t,
                 _ => {} // stale entry: the task exited or was woken twice
@@ -668,7 +730,7 @@ fn schedule(s: &mut SchedGuard) {
     if prev_running {
         prev.state = State::Ready;
         if !prev_idle {
-            s.ready.push_back(prev.pid);
+            s.cpus[index].ready.push_back(prev.pid);
         }
     }
     prev.cpu = None;
@@ -676,6 +738,7 @@ fn schedule(s: &mut SchedGuard) {
     let next = unsafe { &mut *next_ptr };
     next.state = State::Running;
     next.cpu = Some(index);
+    next.last_cpu = index;
     if let Some(stack) = &next.kstack {
         percpu::set_kernel_stack(stack.top());
     }
@@ -704,8 +767,19 @@ pub fn timer_tick() {
     }
     let cpu = s.this_cpu();
     cpu.slice = cpu.slice.saturating_sub(1);
-    let want_switch = cpu.slice == 0 || core::ptr::eq(cpu.current, &*cpu.idle);
-    if want_switch && !s.ready.is_empty() {
+    let want_switch = cpu.slice == 0 || cpu.is_idle();
+    if want_switch && s.any_ready() {
+        schedule(&mut s);
+    }
+}
+
+/// The reschedule IPI: another CPU queued work for us while we were idle
+/// (or sent a signal to the task running here, which the interrupt's
+/// return path takes care of).
+pub fn reschedule_ipi() {
+    let mut s = SCHED.lock();
+    s.this_cpu().kicked = false;
+    if s.this_cpu().is_idle() && s.any_ready() {
         schedule(&mut s);
     }
 }

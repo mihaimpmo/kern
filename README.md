@@ -39,7 +39,7 @@ kern:/> ls /bin | wc -l
 | Interrupts | Local APIC (xAPIC and x2APIC) + I/O APIC, routes taken from ACPI MADT |
 | Timer | APIC timer calibrated against the PIT, 1000 Hz |
 | Multi-core | All CPUs run the kernel (Limine MP request), per-CPU GDT/TSS/idle task, panics stop every CPU |
-| Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
+| Scheduler | Preemptive round-robin, 10 ms time slices, a ready queue per CPU with work stealing, wake-up IPIs to idle CPUs, sleep, wait queues |
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret`, arguments (argv) |
 | Floating point | SSE in user programs, register state saved per task |
 | Files | VFS with an in-memory root (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection, rename |
@@ -158,10 +158,10 @@ Nothing is written to the internal disk. The kernel does drive NVMe SSDs, but it
 
 ### Suggested next steps, roughly in order
 
-1. **SMP, part 2:** per-CPU run queues instead of one shared queue, and wake-up IPIs (the TLB shootdown is done).
-2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
-3. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.
-4. **Threads** (they need the TLB shootdown from step 1), then a real libc port.
+1. **Threads:** `clone` into the same address space, thread-local storage (FS base), futexes, and shootdowns of user mappings; then a real libc port.
+2. **SMP, part 3:** split the scheduler lock, so the per-CPU queues stop sharing one lock.
+3. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
+4. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.
 5. **USB:** xHCI + HID keyboard.
 6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
 

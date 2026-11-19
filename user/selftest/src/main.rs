@@ -1161,6 +1161,44 @@ fn signal_mode(args: &[&str]) -> Option<i32> {
             unsafe { core::arch::asm!("ud2") };
             (counted() != 1) as i32
         }
+        // 100 round trips with a `pong` child: we wake it through a pipe,
+        // it answers with a signal while we spin. Each leg needs an IPI to
+        // be prompt (an idle CPU to wake, a running one to interrupt);
+        // without them each waits for a timer tick. Exit code: elapsed ms.
+        ["ping"] => {
+            handle(SIGUSR1, count);
+            let Ok((r, w)) = fs::pipe(flags::CLOSE_ON_SPAWN) else { return Some(1000) };
+            let me = format!("{}", ulib::getpid());
+            let Ok(pong) = spawn_with(Some(r), None, &["pong", &me]) else { return Some(1001) };
+            let _ = fs::close(r);
+            ulib::sleep_ms(20); // let it block in read
+            let start = ulib::uptime_ms();
+            for i in 1..=100 {
+                let _ = ulib::write(w, b"x");
+                // No system calls in here: returning from one would deliver
+                // the signal without any help from an IPI.
+                let mut spins: u64 = 0;
+                while counted() < i {
+                    spins += 1;
+                    if spins == 20_000_000_000 {
+                        return Some(1002);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            let elapsed = ulib::uptime_ms() - start;
+            let _ = fs::close(w);
+            let _ = ulib::wait(pong);
+            elapsed as i32
+        }
+        ["pong", parent] => {
+            let parent: i64 = parent.parse().unwrap_or(0);
+            let mut byte = [0u8; 1];
+            while ulib::read(ulib::STDIN, &mut byte) == Ok(1) {
+                let _ = ulib::kill(parent, SIGUSR1);
+            }
+            0
+        }
         ["chld"] => {
             handle(SIGCHLD, count);
             let r = run_child(&["exit", "0"]);
@@ -1262,6 +1300,12 @@ fn handlers(t: &mut Suite) {
         let _ = ulib::kill(pid as i64, SIGUSR2);
         let r = ulib::wait(pid);
         check!(t, "handlers preserve every register (rcx, r11, xmm0)", r == exited(0), "{:?}", r);
+    }
+    if ulib::sysinfo().cpus > 1 {
+        let r = run_child(&["ping"]);
+        // About 20 ms with the IPIs, 100 without (a tick per leg).
+        let fast = matches!(r, Ok(ExitStatus::Exited(ms)) if ms < 60);
+        check!(t, "wake-ups and signals reach other CPUs at once (100 round trips)", fast, "{:?} ms", r);
     }
     if let Ok((r_end, w_end)) = fs::pipe(flags::CLOSE_ON_SPAWN) {
         let child = spawn_with(Some(r_end), None, &["eintr"]);
