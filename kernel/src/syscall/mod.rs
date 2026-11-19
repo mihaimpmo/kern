@@ -7,7 +7,7 @@
 //!    0 exit(code)                          6 uptime_ms()
 //!    3 getpid()                            7 spawn(path, len, argv, argc) -> pid
 //!    4 sleep_ms(ms)                        8 wait(pid, code: *mut i64)
-//!    5 yield()                            10 sysinfo(buf: *mut [u64; 5])
+//!    5 yield()                            10 sysinfo(buf: *mut [u64; 8])
 //!   11 ps(buf, len) -> bytes              12 try_wait(code: *mut i64) -> pid, or 0
 //!
 //! Memory (memory.rs):

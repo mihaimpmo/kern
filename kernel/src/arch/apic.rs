@@ -123,6 +123,29 @@ pub fn init_local() {
     lapic_write(REG_SVR, 0x100 | VECTOR_SPURIOUS as u32); // software-enable + spurious vector
 }
 
+/// Send interrupt `vector` to the CPU whose local APIC id is `dest`.
+pub fn send_ipi(dest: u32, vector: u8) {
+    const LEVEL_ASSERT: u32 = 1 << 14;
+    const DELIVERY_PENDING: u32 = 1 << 12;
+    let low = vector as u32 | LEVEL_ASSERT; // fixed delivery, physical destination
+    // The xAPIC ICR is two registers: an interrupt handler sending its own
+    // IPI between the two writes would garble ours.
+    let enabled = cpu::interrupts_enabled();
+    cpu::cli();
+    if is_x2apic() {
+        unsafe { wrmsr(0x800 + (REG_ICR_LOW >> 4), (dest as u64) << 32 | low as u64) };
+    } else {
+        while lapic_read(REG_ICR_LOW) & DELIVERY_PENDING != 0 {
+            core::hint::spin_loop();
+        }
+        lapic_write(REG_ICR_HIGH, dest << 24);
+        lapic_write(REG_ICR_LOW, low);
+    }
+    if enabled {
+        cpu::sti();
+    }
+}
+
 /// Send an NMI to every CPU except the caller (used to stop them on panic).
 pub fn send_nmi_to_others() {
     const DELIVERY_NMI: u32 = 0b100 << 8;

@@ -10,13 +10,21 @@
 use super::{apic, cpu, fpu, idt, percpu};
 use crate::boot::{self, MpInfo};
 use crate::{mm::vmm, syscall, task};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 static ONLINE: AtomicUsize = AtomicUsize::new(1); // the boot CPU
+
+/// Local APIC id of each CPU, by index: where to send it an IPI.
+static LAPIC_IDS: [AtomicU32; percpu::MAX_CPUS] = [const { AtomicU32::new(0) }; percpu::MAX_CPUS];
+
+pub fn lapic_id_of(index: usize) -> u32 {
+    LAPIC_IDS[index].load(Ordering::Relaxed)
+}
 
 /// Start every other CPU and wait for them. Returns how many CPUs are online.
 pub fn start_aps() -> usize {
     let Some(mp) = boot::MP.response() else { return 1 };
+    LAPIC_IDS[0].store(mp.bsp_lapic_id, Ordering::Relaxed);
     let mut started = 0;
     for info in mp.cpus().filter(|c| c.lapic_id != mp.bsp_lapic_id) {
         let index = 1 + started;
@@ -24,6 +32,7 @@ pub fn start_aps() -> usize {
             kprintln!("\x1b[93m[warn]\x1b[0m more than {} CPUs; the rest stay parked", percpu::MAX_CPUS);
             break;
         }
+        LAPIC_IDS[index].store(info.lapic_id, Ordering::Relaxed);
         info.extra_argument.store(index as u64, Ordering::Relaxed);
         info.goto_address.store(ap_entry as *const () as u64, Ordering::Release);
         started += 1;

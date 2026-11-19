@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const VECTOR_TIMER: u64 = 0x20;
 pub const VECTOR_KEYBOARD: u64 = 0x21;
+pub const VECTOR_TLB_SHOOTDOWN: u64 = 0xF0;
 pub const VECTOR_LEGACY_PIC_BASE: u64 = 0xE0; // masked 8259 PIC, remapped out of the way
 pub const VECTOR_SPURIOUS: u64 = 0xFF;
 
@@ -137,6 +138,10 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         }
         VECTOR_KEYBOARD => {
             keyboard::handle_interrupt();
+            apic::eoi();
+        }
+        VECTOR_TLB_SHOOTDOWN => {
+            super::tlb::handle_ipi();
             apic::eoi();
         }
         VECTOR_SPURIOUS => {} // spurious: no EOI

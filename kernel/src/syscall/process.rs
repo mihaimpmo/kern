@@ -106,8 +106,18 @@ pub fn try_wait(code_ptr: u64) -> SysResult {
 
 pub fn sysinfo(buf: u64) -> SysResult {
     let (free, total) = pmm::stats();
-    let fields = [total, free, task::uptime_ms(), task::list().len() as u64, smp::online() as u64];
-    let mut out = [0u8; 40];
+    let (shootdowns, remote_flushes) = crate::arch::tlb::stats();
+    let fields = [
+        total,
+        free,
+        task::uptime_ms(),
+        task::list().len() as u64,
+        smp::online() as u64,
+        crate::mm::kstack::mapped(),
+        shootdowns,
+        remote_flushes,
+    ];
+    let mut out = [0u8; 64];
     for (i, v) in fields.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }

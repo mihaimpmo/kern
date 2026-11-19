@@ -952,6 +952,28 @@ fn leaks(t: &mut Suite) {
     let after = ulib::sysinfo().tasks;
     check!(t, "orphaned child leaves no task entry", r == exited(0) && after == before, "tasks {} -> {}", before, after);
 
+    // Kernel stacks of ended tasks go back (all but a few spares, kept
+    // mapped), which needs a TLB shootdown across the CPUs.
+    let before = ulib::sysinfo();
+    let pids: Vec<ulib::Pid> = (0..32).filter_map(|_| ulib::spawn(NAME, &["sleep-forever"]).ok()).collect();
+    ulib::sleep_ms(20);
+    let during = ulib::sysinfo().kernel_stacks;
+    for &pid in &pids {
+        let _ = ulib::kill(pid as i64, signal::SIGKILL);
+        let _ = ulib::wait(pid);
+    }
+    ulib::sleep_ms(100); // idle CPUs free them
+    let info = ulib::sysinfo();
+    let shootdowns = info.tlb_shootdowns - before.tlb_shootdowns;
+    let remote = info.tlb_remote_flushes - before.tlb_remote_flushes;
+    check!(t, "kernel stacks of ended tasks are freed",
+           pids.len() == 32 && info.kernel_stacks + 20 <= during && shootdowns > 0,
+           "{} children, stacks {} -> {}, {} shootdowns", pids.len(), during, info.kernel_stacks, shootdowns);
+    // QEMU drops even global TLB entries on every CR3 switch, so a missed
+    // flush can't be seen there; check that every CPU took part instead.
+    check!(t, "every other CPU flushes for each shootdown", remote >= shootdowns * (info.cpus - 1),
+           "{} shootdowns on {} CPUs, {} remote flushes", shootdowns, info.cpus, remote);
+
     // A first round lets the kernel heap grow to its working size; after the
     // second, every page must be back.
     let round = || {

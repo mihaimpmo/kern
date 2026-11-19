@@ -35,7 +35,7 @@ kern:/> ls /bin | wc -l
 | Physical memory | Free-list frame allocator built from the firmware memory map |
 | Virtual memory | 4-level paging, one address space per process, shared kernel half, NX |
 | Kernel heap | Grows on demand (`Vec`, `Box`, `String` all work in the kernel) |
-| Kernel stacks | 32 KiB each, with an unmapped guard page below to catch overflows |
+| Kernel stacks | 32 KiB each, with an unmapped guard page below to catch overflows; unused ones are freed, with a TLB shootdown across CPUs |
 | Interrupts | Local APIC (xAPIC and x2APIC) + I/O APIC, routes taken from ACPI MADT |
 | Timer | APIC timer calibrated against the PIT, 1000 Hz |
 | Multi-core | All CPUs run the kernel (Limine MP request), per-CPU GDT/TSS/idle task, panics stop every CPU |
@@ -158,7 +158,7 @@ Nothing is written to the internal disk. The kernel does drive NVMe SSDs, but it
 
 ### Suggested next steps, roughly in order
 
-1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
+1. **SMP, part 2:** per-CPU run queues instead of one shared queue, and wake-up IPIs (the TLB shootdown is done).
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 3. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.
 4. **Threads** (they need the TLB shootdown from step 1), then a real libc port.

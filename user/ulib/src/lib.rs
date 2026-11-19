@@ -377,12 +377,27 @@ pub struct SysInfo {
     pub uptime_ms: u64,
     pub tasks: u64,
     pub cpus: u64,
+    /// Kernel stacks mapped: one per task, plus a few spare.
+    pub kernel_stacks: u64,
+    /// TLB shootdowns since boot.
+    pub tlb_shootdowns: u64,
+    /// Flushes other CPUs did for those: (CPUs - 1) per shootdown.
+    pub tlb_remote_flushes: u64,
 }
 
 pub fn sysinfo() -> SysInfo {
-    let mut raw = [0u64; 5];
+    let mut raw = [0u64; 8];
     unsafe { syscall(sys::SYSINFO, raw.as_mut_ptr() as u64, 0, 0) };
-    SysInfo { total_memory: raw[0], free_memory: raw[1], uptime_ms: raw[2], tasks: raw[3], cpus: raw[4] }
+    SysInfo {
+        total_memory: raw[0],
+        free_memory: raw[1],
+        uptime_ms: raw[2],
+        tasks: raw[3],
+        cpus: raw[4],
+        kernel_stacks: raw[5],
+        tlb_shootdowns: raw[6],
+        tlb_remote_flushes: raw[7],
+    }
 }
 
 // ------------------------------------------------------------------ printing

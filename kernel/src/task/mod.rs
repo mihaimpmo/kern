@@ -787,6 +787,7 @@ pub fn list() -> Vec<TaskInfo> {
 /// The idle loop: runs whenever nothing else is ready on this CPU.
 pub fn idle() -> ! {
     loop {
+        crate::mm::kstack::trim();
         cpu::sti_hlt();
     }
 }

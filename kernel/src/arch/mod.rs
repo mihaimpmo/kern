@@ -8,3 +8,4 @@ pub mod idt;
 pub mod interrupts;
 pub mod percpu;
 pub mod smp;
+pub mod tlb;
