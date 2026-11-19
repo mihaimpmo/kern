@@ -21,6 +21,14 @@ global_asm!(
 .section .text
 .global isr_common
 isr_common:
+    // User mode can set RFLAGS.AC (popfq), and an interrupt doesn't clear
+    // it, unlike `syscall` (FMASK): with SMAP that would leave user memory
+    // open to the kernel for the whole handler. iretq restores the old
+    // value, so clearing it is safe whatever was interrupted.
+    cmp byte ptr [rip + KERN_SMAP], 0
+    je 2f
+    clac
+2:
     test qword ptr [rsp + 24], 3     // came from user mode?
     jz 3f
     swapgs
@@ -112,6 +120,10 @@ const EXCEPTIONS: [&str; 32] = [
 
 #[no_mangle]
 extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
+    if frame.vector != 2 && cpu::user_access_open() {
+        // An NMI can land inside a copy_from_user; nothing else may.
+        panic!("interrupt {:#x} entered with user access open (RFLAGS.AC)", frame.vector);
+    }
     match frame.vector {
         0..=31 => exception(frame),
         VECTOR_TIMER => {

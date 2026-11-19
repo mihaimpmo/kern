@@ -98,6 +98,16 @@ fn main() -> i32 {
             unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut now) };
             (now != set) as i32
         }
+        ["set-ac", ms] => {
+            // RFLAGS.AC set in user mode while timer interrupts come in:
+            // the kernel must not run its handlers with it (SMAP off).
+            unsafe { core::arch::asm!("pushfq", "or qword ptr [rsp], 0x40000", "popfq") };
+            let end = ulib::uptime_ms() + ms.parse::<u64>().unwrap_or(0);
+            while ulib::uptime_ms() < end {
+                core::hint::spin_loop();
+            }
+            0
+        }
         ["say", text] => {
             println!("{}", text);
             0
@@ -915,6 +925,8 @@ fn signals(t: &mut Suite) {
     check!(t, "invalid opcode is SIGILL", r == killed(ulib::signal::SIGILL), "{:?}", r);
     let r = run_child(&["divide"]);
     check!(t, "divide by zero is SIGFPE", r == killed(ulib::signal::SIGFPE), "{:?}", r);
+    let r = run_child(&["set-ac", "100"]);
+    check!(t, "RFLAGS.AC from user mode doesn't reach interrupt handlers", r == exited(0), "{:?}", r);
 
     // Errors.
     check!(t, "killing init is EPERM", ulib::kill(1, SIGTERM) == Err(Errno::EPERM));

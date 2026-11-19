@@ -167,7 +167,10 @@ const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 
-static SMAP: AtomicBool = AtomicBool::new(false);
+/// Whether SMAP is on. Also read by `isr_common`, hence the fixed name.
+#[no_mangle]
+pub static KERN_SMAP: AtomicBool = AtomicBool::new(false);
+use KERN_SMAP as SMAP;
 
 /// Which of the optional protections `enable_protections` turned on.
 pub struct Protections {
@@ -222,4 +225,12 @@ pub fn user_access_end() {
     if SMAP.load(Ordering::Relaxed) {
         unsafe { asm!("clac", options(nomem, nostack)) };
     }
+}
+
+/// Whether RFLAGS.AC is set here, which with SMAP on means the kernel may
+/// touch user pages. It must never be set in an interrupt handler.
+pub fn user_access_open() -> bool {
+    let flags: u64;
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    SMAP.load(Ordering::Relaxed) && flags & (1 << 18) != 0
 }
