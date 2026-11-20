@@ -47,10 +47,14 @@
 //!    3 getpid()                           the process
 //!   41 thread_create(rip, rsp, arg, tls, exit_word: *mut u32) -> tid
 //!        a new thread at rip, stack rsp, rdi = arg, FS base = tls; when
-//!        it ends, *exit_word is set to 0 (if exit_word isn't 0)
+//!        it ends, *exit_word is set to 0 and woken (if exit_word isn't 0)
 //!   42 thread_exit(code)                  ends this thread; the process ends
 //!                                         with its last thread
 //!   43 gettid()                           44 set_fs_base(addr)
+//!   45 futex_wait(addr: *u32, expected)   sleeps while *addr == expected;
+//!                                         EAGAIN if it doesn't, EINTR
+//!   46 futex_wake(addr: *u32, n) -> how many of its sleepers were woken
+//!        (futex.rs; the thread_create exit word is woken this way too)
 //!
 //! Exit statuses (wait, try_wait) are the exit code in the low 32 bits, or
 //! 1 << 32 | signal for a process that was killed. CPU faults in user mode
@@ -65,10 +69,12 @@
 //! which check the pages and open the SMAP window around the copy.
 
 mod file;
+mod futex;
 mod memory;
 mod process;
 mod signal;
 
+pub use futex::wake as futex_wake;
 pub use signal::deliver_from_interrupt;
 
 use crate::arch::cpu::{self, msr, rdmsr, wrmsr};
@@ -343,6 +349,8 @@ fn call(f: &mut SyscallFrame) -> SysResult {
         42 => task::exit_thread(ExitStatus::Exited(a0 as i32)),
         43 => Ok(task::current_tid()),
         44 => process::set_fs_base(a0),
+        45 => futex::wait(a0, a1),
+        46 => futex::wake_syscall(a0, a1),
         _ => Err(ENOSYS),
     }
 }

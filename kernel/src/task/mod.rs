@@ -677,6 +677,7 @@ pub fn exit_thread(status: ExitStatus) -> ! {
     if exit_word != 0 {
         // A thread that `join`s us may free our stack once it sees this.
         let _ = crate::syscall::put_user_u32(exit_word, 0);
+        crate::syscall::futex_wake(exit_word, u64::MAX);
     }
     // Close the process's files now, outside the scheduler lock: closing
     // can wake other tasks (the reader at the other end of a pipe, say).
@@ -1163,13 +1164,17 @@ pub struct Interrupted;
 /// already on the queue.
 ///
 /// Lock order: the caller's lock, then the scheduler, then `waiters`.
+///
+/// `waiters` only ever holds tasks blocked on this queue: a task woken by
+/// something else (a signal) takes itself off when it resumes. So `wake`
+/// can count whom it woke, and never wakes a task blocked elsewhere.
 pub struct WaitQueue {
-    waiters: SpinLock<Vec<Pid>>,
+    waiters: SpinLock<VecDeque<Pid>>,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        Self { waiters: SpinLock::new(Vec::new()) }
+        Self { waiters: SpinLock::new(VecDeque::new()) }
     }
 
     /// Like `wait`, but gives up if a signal arrives (or is already pending),
@@ -1183,6 +1188,7 @@ impl WaitQueue {
         self.enqueue_current(&mut s);
         let (lock, irq) = guard.release();
         schedule(&mut s);
+        self.dequeue_current(&mut s);
         let interrupted = s.current().signals.deliverable() != 0;
         drop(s);
         if interrupted {
@@ -1201,6 +1207,7 @@ impl WaitQueue {
         self.enqueue_current(&mut s);
         let (lock, irq) = guard.release();
         schedule(&mut s);
+        self.dequeue_current(&mut s);
         drop(s);
         lock.lock_with(irq)
     }
@@ -1209,12 +1216,44 @@ impl WaitQueue {
     fn block_locked(&self, s: &mut SchedGuard) {
         self.enqueue_current(s);
         schedule(s);
+        self.dequeue_current(s);
     }
 
     fn enqueue_current(&self, s: &mut Scheduler) {
         let t = s.current();
         t.state = State::Blocked;
-        self.waiters.lock().push(t.pid);
+        self.waiters.lock().push_back(t.pid);
+    }
+
+    /// Back from `schedule`: if something other than this queue woke us, we
+    /// are still on it.
+    fn dequeue_current(&self, s: &mut Scheduler) {
+        let me = s.current().pid;
+        self.waiters.lock().retain(|&p| p != me);
+    }
+
+    /// Whether no task is waiting.
+    pub fn is_empty(&self) -> bool {
+        self.waiters.lock().is_empty()
+    }
+
+    /// Wake up to `n` tasks, longest waiting first; returns how many.
+    pub fn wake(&self, n: u64) -> u64 {
+        if n == 0 || self.is_empty() {
+            return 0;
+        }
+        let mut s = SCHED.lock();
+        let mut woken = 0;
+        while woken < n {
+            let Some(pid) = self.waiters.lock().pop_front() else { break };
+            // Not blocked any more: woken by a signal, and about to take
+            // itself off the queue.
+            if s.tasks.get(&pid).map_or(false, |t| t.state == State::Blocked) {
+                s.make_ready(pid);
+                woken += 1;
+            }
+        }
+        woken
     }
 
     /// Wake every task sleeping on the queue. Don't hold the scheduler lock.

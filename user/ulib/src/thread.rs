@@ -52,7 +52,7 @@ pub unsafe fn read_fs(offset: u64) -> u64 {
 
 /// Start a thread at `entry` with stack pointer `stack` (16-byte aligned),
 /// `arg` in rdi and FS base `tls`. When it ends, the kernel sets the u32 at
-/// `exit_word` (if not null) to 0.
+/// `exit_word` (if not null) to 0 and wakes its futex waiters.
 ///
 /// # Safety
 /// `entry` must be code that never returns (it has no return address) and

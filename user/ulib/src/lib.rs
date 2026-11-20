@@ -66,6 +66,8 @@ pub mod sys {
     pub const THREAD_EXIT: u64 = 42;
     pub const GETTID: u64 = 43;
     pub const SET_FS_BASE: u64 = 44;
+    pub const FUTEX_WAIT: u64 = 45;
+    pub const FUTEX_WAKE: u64 = 46;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.

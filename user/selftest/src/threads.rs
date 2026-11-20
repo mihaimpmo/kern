@@ -1,11 +1,11 @@
 //! Threads: several flows of control sharing one process.
 
-use crate::{exited, run_child, Suite, BAD_PTR, KILLED_SEGV, NAME};
+use crate::{exited, raw, run_child, Suite, BAD_PTR, KILLED_SEGV, NAME};
 use alloc::{format, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ulib::signal::{self, Handler, SIGUSR1};
 use ulib::sync::Mutex;
-use ulib::{prot, thread, ExitStatus};
+use ulib::{prot, sys, thread, ExitStatus};
 
 /// Child modes: Some(exit code).
 pub fn mode(args: &[&str]) -> Option<i32> {
@@ -54,6 +54,7 @@ pub fn mode(args: &[&str]) -> Option<i32> {
             1
         }
         ["unmap-under-reader"] => unmap_under_reader(),
+        ["futex-eintr"] => futex_eintr(),
         ["thread-churn"] => {
             let mut sum = 0;
             for i in 0..20u64 {
@@ -168,6 +169,7 @@ pub fn suite(t: &mut Suite) {
 
     fs_base(t);
     parallel(t);
+    futexes(t);
 
     let r = run_child(&["thread-churn"]);
     check!(t, "60 threads started and joined", r == exited(0), "{:?}", r);
@@ -205,6 +207,81 @@ pub fn suite(t: &mut Suite) {
         check!(t, "a signal ends every thread of a process", r == Ok(ExitStatus::Killed(signal::SIGTERM)) && during == tasks + 6 && after == tasks,
                "{:?}, tasks {} -> {} -> {}", r, tasks, during, after);
     }
+}
+
+/// futex_wait / futex_wake directly.
+fn futexes(t: &mut Suite) {
+    use ulib::sync::{wait, wake};
+    use ulib::Errno;
+    static WORD: AtomicU32 = AtomicU32::new(0);
+    static ASLEEP: AtomicU32 = AtomicU32::new(0);
+
+    let r = wait(&WORD, 1);
+    check!(t, "futex_wait on a changed value is EAGAIN", r == Err(Errno::EAGAIN), "{:?}", r);
+    let r = wake(&WORD, 1);
+    check!(t, "futex_wake with nobody waiting wakes 0", r == 0, "{}", r);
+    let r = raw(sys::FUTEX_WAIT, 2, 0, 0);
+    check!(t, "futex_wait on a misaligned word is EINVAL", r == -Errno::EINVAL.0, "got {}", r);
+    let r = raw(sys::FUTEX_WAIT, BAD_PTR, 0, 0);
+    check!(t, "futex_wait on a bad pointer is EFAULT", r == -Errno::EFAULT.0, "got {}", r);
+
+    // Three sleepers: wake one, then the rest. Each counts itself asleep
+    // just before waiting, so give them a moment to really be asleep.
+    WORD.store(0, Ordering::Relaxed);
+    ASLEEP.store(0, Ordering::Relaxed);
+    let sleepers: Vec<_> = (0..3)
+        .filter_map(|_| {
+            thread::spawn(|| {
+                ASLEEP.fetch_add(1, Ordering::Relaxed);
+                let mut calls = 0;
+                while WORD.load(Ordering::Acquire) == 0 {
+                    let _ = wait(&WORD, 0);
+                    calls += 1;
+                }
+                calls
+            })
+            .ok()
+        })
+        .collect();
+    while ASLEEP.load(Ordering::Relaxed) < 3 {
+        ulib::yield_now();
+    }
+    ulib::sleep_ms(50);
+    let first = wake(&WORD, 1); // still 0: the woken one goes back to sleep
+    ulib::sleep_ms(20);
+    WORD.store(1, Ordering::Release);
+    let rest = wake(&WORD, u32::MAX);
+    let calls: Vec<u32> = sleepers.into_iter().map(|h| h.join()).collect();
+    check!(t, "futex_wake wakes as many as asked", first == 1 && rest == 3, "woke {} then {}", first, rest);
+    // Each waited once, the one woken early twice: no busy waiting.
+    check!(t, "futex waiters sleep", calls.len() == 3 && calls.iter().sum::<u32>() == 4, "wait calls {:?}", calls);
+
+    let r = run_child(&["futex-eintr"]);
+    check!(t, "a signal interrupts futex_wait with EINTR", r == exited(0), "{:?}", r);
+}
+
+/// Exit code 0 if a signal cuts a futex wait short with EINTR. (Run in a
+/// child: pid 1 can't be signalled.)
+fn futex_eintr() -> i32 {
+    static WORD: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn nothing(_: i32) {}
+    let _ = signal::set_handler(SIGUSR1, Handler::Call(nothing));
+    let me = ulib::getpid();
+    // The sender blocks the signal, so it comes to this thread. If the wait
+    // isn't cut short, it wakes us after a while so the check fails
+    // instead of hanging.
+    let sender = thread::spawn(move || {
+        signal::block(signal::bit(SIGUSR1));
+        ulib::sleep_ms(30);
+        let _ = ulib::kill(me as i64, SIGUSR1);
+        ulib::sleep_ms(500);
+        WORD.store(1, Ordering::Release);
+        ulib::sync::wake(&WORD, 1);
+    });
+    let r = ulib::sync::wait(&WORD, 0);
+    WORD.store(1, Ordering::Release);
+    drop(sender); // detach: it may still be sleeping
+    (r != Err(ulib::Errno::EINTR)) as i32
 }
 
 /// FS base (thread-local storage) is per thread and survives switches.
