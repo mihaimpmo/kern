@@ -168,6 +168,12 @@ impl Signals {
         *self.action(sig)
     }
 
+    /// What another thread of the same process starts with: the same
+    /// actions and mask, nothing pending.
+    pub fn for_new_thread(&self) -> Signals {
+        Signals { pending: 0, blocked: self.blocked, actions: self.actions, saved_mask: None }
+    }
+
     /// A new program can't run the old one's handlers: they go back to the
     /// default. Ignored signals stay ignored, the mask and pending signals
     /// carry over (as in POSIX).

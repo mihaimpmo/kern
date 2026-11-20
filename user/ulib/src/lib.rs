@@ -12,6 +12,8 @@ extern crate alloc;
 pub mod fs;
 pub mod heap;
 pub mod signal;
+pub mod sync;
+pub mod thread;
 pub mod time;
 
 use core::arch::{asm, global_asm};
@@ -60,6 +62,10 @@ pub mod sys {
     pub const SIGPROCMASK: u64 = 38;
     pub const SIGRETURN: u64 = 39;
     pub const SIGSUSPEND: u64 = 40;
+    pub const THREAD_CREATE: u64 = 41;
+    pub const THREAD_EXIT: u64 = 42;
+    pub const GETTID: u64 = 43;
+    pub const SET_FS_BASE: u64 = 44;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -99,6 +105,7 @@ impl Errno {
     pub const ENOEXEC: Errno = Errno(8);
     pub const EBADF: Errno = Errno(9);
     pub const ECHILD: Errno = Errno(10);
+    pub const EAGAIN: Errno = Errno(11);
     pub const ENOMEM: Errno = Errno(12);
     pub const EFAULT: Errno = Errno(14);
     pub const EEXIST: Errno = Errno(17);
@@ -125,6 +132,7 @@ impl Errno {
             8 => "not an executable",
             9 => "bad file descriptor",
             10 => "no such child",
+            11 => "try again",
             12 => "out of memory",
             14 => "bad address",
             17 => "already exists",
@@ -168,11 +176,13 @@ pub(crate) fn check(ret: i64) -> Result<u64, Errno> {
 
 pub type Pid = u64;
 
+/// End the process: every thread of it.
 pub fn exit(code: i32) -> ! {
     unsafe { syscall(sys::EXIT, code as i64 as u64, 0, 0) };
     unreachable!("exit returned")
 }
 
+/// The process's id (shared by its threads; see `thread::id`).
 pub fn getpid() -> Pid {
     unsafe { syscall(sys::GETPID, 0, 0, 0) as Pid }
 }

@@ -31,7 +31,7 @@ fn main() -> i32 {
         *slot = arg;
         argc += 1;
     }
-    if let Some(code) = signal_mode(&args[1..argc]) {
+    if let Some(code) = signal_mode(&args[1..argc]).or_else(|| threads::mode(&args[1..argc])) {
         return code;
     }
     match &args[1..argc] {
@@ -185,6 +185,8 @@ macro_rules! check {
     };
 }
 
+mod threads;
+
 fn raw(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     unsafe { syscall6(n, a0, a1, a2, 0, 0, 0) }
 }
@@ -211,6 +213,7 @@ fn run_all() -> i32 {
     signals(&mut t);
     exec(&mut t);
     handlers(&mut t);
+    threads::suite(&mut t);
     leaks(&mut t);
     println!("selftest: {} checks, {} failed", t.run, t.failed);
     t.failed as i32
@@ -987,6 +990,7 @@ fn leaks(t: &mut Suite) {
         round();
         let _ = run_child(&["hog-then-exec", "16"]);
         let _ = run_child(&["catch-many"]);
+        let _ = run_child(&["thread-churn"]);
     };
     round();
     let before = ulib::sysinfo().free_memory;

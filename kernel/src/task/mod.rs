@@ -1,6 +1,7 @@
 //! Tasks and the preemptive round-robin scheduler, shared by all CPUs.
 //!
-//! Every task (kernel thread or user process) has its own kernel stack.
+//! A task is one thread: a kernel thread, or a thread of a user process.
+//! Every task has its own kernel stack.
 //! Switching tasks = saving callee-saved registers on the old kernel stack,
 //! swapping stack pointers, and popping them from the new one. Each CPU has
 //! an idle task (pid 0, not in the task table) that runs when nothing else
@@ -20,6 +21,20 @@
 //! ready/blocked" and "stop running on its stack" are a single step as far as
 //! other CPUs can tell: none of them can pick a task up while its registers
 //! are still being saved.
+//!
+//! Threads: a process starts with one task, and `spawn_thread` adds more
+//! that share its `Process` (memory, files, working directory). The process
+//! is known by the pid of its first task, the *leader*, which every thread
+//! carries as `tgid`; `getpid` returns it and the parent waits for it. The
+//! process ends when its last thread does. Ending the process (`exit`, a
+//! fatal signal) ends every thread: `exit_current` records the exit status
+//! in the `Process`, marks the others `doomed` and sends them SIGKILL, and
+//! each ends itself on its way back to user mode. The leader's entry stays
+//! (a zombie, once its thread is gone) until the parent collects the
+//! process's status, which `wait` only does once every thread has ended.
+//! Signal actions belong to the process: each thread has a copy, and
+//! changes are made to all of them. A signal sent to the process goes to
+//! one thread that doesn't block it.
 
 mod elf;
 pub mod exec;
@@ -66,12 +81,30 @@ impl ExitStatus {
             ExitStatus::Killed(signal) => 1 << 32 | signal as u64,
         }
     }
+
+    /// Never 0, so 0 can mean "none".
+    fn to_raw(self) -> u64 {
+        1 << 63 | self.encode()
+    }
+
+    fn from_raw(raw: u64) -> Option<ExitStatus> {
+        match raw {
+            0 => None,
+            r if r >> 32 & 1 != 0 => Some(ExitStatus::Killed(r as u8)),
+            r => Some(ExitStatus::Exited(r as u32 as i32)),
+        }
+    }
 }
 
 pub struct Task {
+    /// Unique to this thread (Linux's tid).
     pub pid: Pid,
+    /// The process: the leader's pid (Linux's tgid). Its own pid for a
+    /// kernel thread or a process's first thread.
+    pub tgid: Pid,
     pub name: String,
     pub state: State,
+    /// The process that started this one (a tgid); only on leaders.
     pub parent: Option<Pid>,
     /// CPU the task is running on, while `state == Running`.
     pub cpu: Option<usize>,
@@ -90,14 +123,30 @@ pub struct Task {
     /// Saved x87/SSE registers, for user tasks (the kernel doesn't use them).
     fpu: Option<Box<FpuState>>,
     wake_at: u64,
+    /// Where it enters user mode for the first time, and with what in rdi.
     user_entry: u64,
     user_stack: u64,
+    user_arg: u64,
+    /// FS base: the thread's thread-local storage.
+    fs_base: u64,
+    /// A user u32 to zero, and wake futex waiters on, when the thread ends:
+    /// how `join` knows the thread no longer uses its stack (0: none).
+    exit_word: u64,
+    /// The process is ending (or `exec` is replacing the program): this
+    /// thread must end too, whatever signal tells it.
+    doomed: bool,
+    /// In `exit_thread`, past the point of counting as a live thread.
+    exiting: bool,
+    /// On a leader: its process has ended (`end_process` has run), though
+    /// some of its threads may not be zombies yet.
+    ended: bool,
 }
 
 impl Task {
     fn new(pid: Pid, name: &str, parent: Option<Pid>) -> Task {
         Task {
             pid,
+            tgid: pid,
             name: String::from(name),
             state: State::Ready,
             parent,
@@ -113,7 +162,23 @@ impl Task {
             wake_at: 0,
             user_entry: 0,
             user_stack: 0,
+            user_arg: 0,
+            fs_base: 0,
+            exit_word: 0,
+            doomed: false,
+            exiting: false,
+            ended: false,
         }
+    }
+
+    fn alive(&self) -> bool {
+        self.state != State::Zombie && !self.exiting
+    }
+
+    /// A process whose exit status can be collected: the leader, once every
+    /// thread has ended.
+    fn collectable(&self) -> bool {
+        self.state == State::Zombie && self.ended
     }
 }
 
@@ -125,6 +190,25 @@ pub struct Process {
     pub cwd: SpinLock<String>,
     /// Process group, for signalling a whole job (Ctrl+C).
     pub pgid: AtomicU64,
+    /// How the process ends, once something has ended it as a whole
+    /// (`ExitStatus::to_raw`; 0 while it runs).
+    exit: AtomicU64,
+}
+
+impl Process {
+    pub fn new(space: UserSpace, inherit: Inherit) -> Process {
+        Process {
+            space: SpinLock::new(space),
+            files: SpinLock::new(inherit.files),
+            cwd: SpinLock::new(inherit.cwd),
+            pgid: AtomicU64::new(inherit.pgid),
+            exit: AtomicU64::new(0),
+        }
+    }
+
+    fn exit_status(&self) -> Option<ExitStatus> {
+        ExitStatus::from_raw(self.exit.load(Ordering::Relaxed))
+    }
 }
 
 /// What a new process starts with besides its program.
@@ -174,6 +258,7 @@ static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
 });
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static CHILD_EXITED: WaitQueue = WaitQueue::new();
+static THREAD_EXITED: WaitQueue = WaitQueue::new();
 
 type SchedGuard = SpinLockGuard<'static, Scheduler>;
 
@@ -213,6 +298,11 @@ impl Scheduler {
         apic::send_ipi(smp::lapic_id_of(index), VECTOR_RESCHEDULE as u8);
     }
 
+    /// The live threads of process `tgid`.
+    fn threads(&self, tgid: Pid) -> impl Iterator<Item = &Task> {
+        self.tasks.values().map(|t| &**t).filter(move |t| t.tgid == tgid && t.alive())
+    }
+
     /// Whether any CPU has a task waiting.
     fn any_ready(&self) -> bool {
         self.cpus.iter().any(|c| !c.ready.is_empty())
@@ -234,7 +324,7 @@ impl Scheduler {
 extern "C" {
     fn switch_context(old_rsp: *mut u64, new_rsp: u64);
     fn task_trampoline();
-    fn enter_user(rip: u64, rsp: u64) -> !;
+    fn enter_user(rip: u64, rsp: u64, arg: u64) -> !;
 }
 
 global_asm!(
@@ -267,7 +357,7 @@ task_trampoline:
     call task_start
     ud2
 
-// Drop to ring 3 at rip = rdi with stack rsp = rsi.
+// Drop to ring 3 at rip = rdi with stack rsp = rsi and rdi = rdx.
 .global enter_user
 enter_user:
     cli
@@ -277,12 +367,12 @@ enter_user:
     push 0x202         // RFLAGS: interrupts on
     push 0x23          // CS  = user code
     push rdi           // RIP
+    mov rdi, rdx
     xor eax, eax
     xor ebx, ebx
     xor ecx, ecx
     xor edx, edx
     xor esi, esi
-    xor edi, edi
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d
@@ -339,31 +429,47 @@ pub fn add_cpu() {
     s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS, ready: VecDeque::new(), kicked: false });
 }
 
-fn add_task(name: &str, parent: Option<Pid>, process: Option<Process>, entry: fn(u64), arg: u64) -> Option<Pid> {
+/// A task that will run `entry(arg)` on a fresh kernel stack; `insert`
+/// gives it a pid.
+fn new_task(name: &str, parent: Option<Pid>, entry: fn(u64), arg: u64) -> Option<Box<Task>> {
     let kstack = KernelStack::new()?;
-    let rsp = prepare_stack(kstack.top(), entry, arg);
-    let mut s = SCHED.lock();
+    let mut task = Box::new(Task::new(0, name, parent));
+    task.rsp = prepare_stack(kstack.top(), entry, arg);
+    task.kstack = Some(kstack);
+    task.last_cpu = percpu::index(); // start near the parent
+    Some(task)
+}
+
+/// A user task of `process`, entering user mode at `rip` with `rsp`.
+fn new_user_task(name: &str, parent: Option<Pid>, process: Arc<Process>, rip: u64, rsp: u64) -> Option<Box<Task>> {
+    let mut task = new_task(name, parent, user_task_entry, 0)?;
+    task.pml4 = process.space.lock().pml4();
+    task.process = Some(process);
+    task.fpu = Some(FpuState::new());
+    task.user_entry = rip;
+    task.user_stack = rsp;
+    Some(task)
+}
+
+/// Add `task` to the table, ready to run; returns its pid. Unless it was
+/// given a process to join (`tgid`), it starts its own.
+fn insert(s: &mut Scheduler, mut task: Box<Task>) -> Pid {
     let pid = s.next_pid;
     s.next_pid += 1;
-    let mut task = Box::new(Task::new(pid, name, parent));
-    task.last_cpu = percpu::index(); // start near the parent
-    task.rsp = rsp;
-    task.kstack = Some(kstack);
-    if let Some(process) = process {
-        task.pml4 = process.space.lock().pml4();
-        task.process = Some(Arc::new(process));
-        task.fpu = Some(FpuState::new());
+    task.pid = pid;
+    if task.tgid == 0 {
+        task.tgid = pid;
     }
     s.tasks.insert(pid, task);
-    Some(pid)
+    s.make_ready(pid);
+    pid
 }
 
 /// Start a kernel thread running `entry(arg)`.
 #[allow(dead_code)]
 pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64) -> Option<Pid> {
-    let pid = add_task(name, None, None, entry, arg)?;
-    SCHED.lock().make_ready(pid);
-    Some(pid)
+    let task = new_task(name, None, entry, arg)?;
+    Some(insert(&mut SCHED.lock(), task))
 }
 
 /// Load an ELF executable into a new address space and start it in ring 3
@@ -376,25 +482,49 @@ fn spawn_user(
     inherit: Inherit,
 ) -> Result<Pid, exec::LoadError> {
     let image = exec::load(image, args)?;
-    let process = Process {
-        space: SpinLock::new(image.space),
-        files: SpinLock::new(inherit.files),
-        cwd: SpinLock::new(inherit.cwd),
-        pgid: AtomicU64::new(inherit.pgid),
-    };
-    let pid = add_task(name, parent, Some(process), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
+    let process = Arc::new(Process::new(image.space, inherit));
+    let task = new_user_task(name, parent, process, image.entry, image.stack).ok_or(exec::LoadError::NoMemory)?;
+    Ok(insert(&mut SCHED.lock(), task))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThreadError {
+    NoMemory,
+    /// The process is ending.
+    Exiting,
+}
+
+/// Start another thread in the calling process: it enters user mode at
+/// `rip` with stack `rsp`, `arg` in rdi and FS base `tls`. It has the
+/// caller's signal mask and none of its pending signals. When it ends, the
+/// u32 at `exit_word` (if not 0) is zeroed and its futex waiters woken.
+pub fn spawn_thread(rip: u64, rsp: u64, arg: u64, tls: u64, exit_word: u64) -> Result<Pid, ThreadError> {
+    let me = current_process().expect("thread from a kernel thread");
+    let name = SCHED.lock().current().name.clone();
+    let mut task = new_user_task(&name, None, me, rip, rsp).ok_or(ThreadError::NoMemory)?;
+    task.user_arg = arg;
+    task.fs_base = tls;
+    task.exit_word = exit_word;
     let mut s = SCHED.lock();
-    let t = s.tasks.get_mut(&pid).unwrap();
-    t.user_entry = image.entry;
-    t.user_stack = image.stack;
-    s.make_ready(pid);
-    Ok(pid)
+    let creator = s.current();
+    // Checked under the lock that `exit_current` dooms threads under, so
+    // the new thread can't miss the end of its process.
+    let ending = creator.process.as_ref().map_or(true, |p| p.exit_status().is_some());
+    if creator.doomed || ending {
+        drop(s);
+        return Err(ThreadError::Exiting);
+    }
+    task.tgid = creator.tgid;
+    task.signals = creator.signals.for_new_thread();
+    Ok(insert(&mut s, task))
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum SpawnError {
     Fs(crate::fs::FsError),
     Load(exec::LoadError),
+    /// `exec`: the process was ended meanwhile.
+    Interrupted,
 }
 
 impl core::fmt::Display for SpawnError {
@@ -402,6 +532,7 @@ impl core::fmt::Display for SpawnError {
         match self {
             SpawnError::Fs(e) => write!(f, "{:?}", e),
             SpawnError::Load(e) => write!(f, "{}", e),
+            SpawnError::Interrupted => write!(f, "interrupted"),
         }
     }
 }
@@ -436,6 +567,10 @@ pub fn exec_current(path: &str, args: &[&[u8]]) -> Result<(u64, u64), SpawnError
     let image = exec::load(&data, args).map_err(SpawnError::Load)?;
     drop(data);
     let fpu = FpuState::new();
+    // The new program starts with this thread alone.
+    if end_other_threads().is_err() {
+        return Err(SpawnError::Interrupted);
+    }
 
     // The point of no return. Until CR3 is switched below, the task keeps
     // running on the old page tables, which stay alive in `old`.
@@ -449,6 +584,9 @@ pub fn exec_current(path: &str, args: &[&[u8]]) -> Result<(u64, u64), SpawnError
         tlb::switch_to(pml4);
         t.name = name;
         t.signals.reset_for_exec();
+        t.fs_base = 0;
+        unsafe { cpu::wrmsr(cpu::msr::FS_BASE, 0) };
+        t.exit_word = 0;
         // The live registers are the task's (the kernel never uses them).
         fpu.restore();
         t.fpu = Some(fpu);
@@ -460,38 +598,122 @@ pub fn exec_current(path: &str, args: &[&[u8]]) -> Result<(u64, u64), SpawnError
 }
 
 fn user_task_entry(_: u64) {
-    let (rip, rsp) = {
+    let (rip, rsp, arg) = {
         let mut s = SCHED.lock();
         let t = s.current();
-        (t.user_entry, t.user_stack)
+        (t.user_entry, t.user_stack, t.user_arg)
     };
-    unsafe { enter_user(rip, rsp) };
+    unsafe { enter_user(rip, rsp, arg) }; // `schedule` has loaded FS base
 }
 
-/// Terminate the running task. Its memory is freed by the scheduler once
-/// we have switched away from its stack.
+/// End every other thread of the calling process and wait until they have
+/// (for `exec`). Fails if this thread is to end as well.
+fn end_other_threads() -> Result<(), Interrupted> {
+    let mut s = SCHED.lock();
+    loop {
+        let me = s.current();
+        if me.doomed || me.signals.deliverable() & signal::bit(signal::SIGKILL) != 0 {
+            return Err(Interrupted);
+        }
+        let (pid, tgid) = (me.pid, me.tgid);
+        let others: Vec<Pid> =
+            s.tasks.values().filter(|t| t.tgid == tgid && t.pid != pid && t.state != State::Zombie).map(|t| t.pid).collect();
+        if others.is_empty() {
+            return Ok(());
+        }
+        for other in others {
+            doom(&mut s, other);
+        }
+        THREAD_EXITED.block_locked(&mut s);
+    }
+}
+
+/// Make thread `pid` end on its way back to user mode, waking it if needed.
+fn doom(s: &mut Scheduler, pid: Pid) {
+    if let Some(t) = s.tasks.get_mut(&pid) {
+        if !t.doomed {
+            t.doomed = true;
+            post_locked(s, pid, signal::SIGKILL);
+        }
+    }
+}
+
+/// End the calling process, every thread of it, with `status` (unless it
+/// is already ending, with a status of its own).
 pub fn exit_current(status: ExitStatus) -> ! {
-    // Close our files now, outside the scheduler lock: closing can wake
-    // other tasks (the reader at the other end of a pipe, say).
-    if let Some(process) = current_process() {
+    {
+        let mut s = SCHED.lock();
+        let me = s.current();
+        let (pid, tgid) = (me.pid, me.tgid);
+        let first = me.process.as_ref().map_or(false, |p| {
+            p.exit.compare_exchange(0, status.to_raw(), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        });
+        if first {
+            let others: Vec<Pid> = s.threads(tgid).filter(|t| t.pid != pid).map(|t| t.pid).collect();
+            for other in others {
+                doom(&mut s, other);
+            }
+        }
+    }
+    exit_thread(status)
+}
+
+/// End the calling thread. Its memory is freed by the scheduler once we
+/// have switched away from its stack. If it was the last thread of its
+/// process, the process ends: with the status it was ended with, if any,
+/// else with `status`.
+pub fn exit_thread(status: ExitStatus) -> ! {
+    let process = current_process();
+    let (pid, tgid, exit_word, last) = {
+        let mut s = SCHED.lock();
+        let me = s.current();
+        assert!(me.pid != 0, "idle task tried to exit");
+        me.exiting = true;
+        let (pid, tgid, exit_word) = (me.pid, me.tgid, me.exit_word);
+        let last = s.threads(tgid).next().is_none();
+        (pid, tgid, exit_word, last)
+    };
+    let status = process.as_ref().and_then(|p| p.exit_status()).filter(|_| last).unwrap_or(status);
+    if exit_word != 0 {
+        // A thread that `join`s us may free our stack once it sees this.
+        let _ = crate::syscall::put_user_u32(exit_word, 0);
+    }
+    // Close the process's files now, outside the scheduler lock: closing
+    // can wake other tasks (the reader at the other end of a pipe, say).
+    if let (true, Some(process)) = (last, &process) {
         let files = process.files.lock().take_all();
         drop(files);
     }
+    drop(process);
+
     let mut s = SCHED.lock();
-    let pid = s.current().pid;
-    assert!(pid != 0, "idle task tried to exit");
-    if pid == 1 {
+    if last && tgid == 1 {
         drop(s);
         crate::power::init_exited(status);
     }
+    if last {
+        end_process(&mut s, tgid, status);
+    }
+    let t = s.current();
+    t.state = State::Zombie;
+    t.exit = status;
+    s.zombies.push(pid);
+    THREAD_EXITED.wake_all_locked(&mut s);
+    schedule(&mut s);
+    unreachable!("zombie task was scheduled");
+}
+
+/// The last thread of process `tgid` is ending: give the leader's entry the
+/// process's exit status, orphan its children and tell its parent.
+fn end_process(s: &mut SchedGuard, tgid: Pid, status: ExitStatus) {
     // Orphan our children. A child still running, or exited but not yet
     // reaped, is removed by `reap` once it has no parent. A child that was
     // already reaped is only waiting for us to collect its exit code, which
     // will now never happen, so drop its entry here.
-    let s_ref = &mut *s;
+    let s_ref = &mut **s;
     let zombies = &s_ref.zombies;
     s_ref.tasks.retain(|_, t| {
-        if t.parent != Some(pid) {
+        if t.parent != Some(tgid) {
             return true;
         }
         if t.state == State::Zombie && !zombies.contains(&t.pid) {
@@ -500,17 +722,22 @@ pub fn exit_current(status: ExitStatus) -> ! {
         t.parent = None;
         true
     });
-    let t = s.current();
-    t.state = State::Zombie;
-    t.exit = status;
-    let parent = t.parent;
-    s.zombies.push(pid);
-    if let Some(parent) = parent {
-        post_locked(&mut s, parent, signal::SIGCHLD);
+    let Some(leader) = s.tasks.get_mut(&tgid) else { return };
+    leader.exit = status;
+    leader.ended = true;
+    let (parent, reaped) = (leader.parent, leader.state == State::Zombie && !s.zombies.contains(&tgid));
+    match parent {
+        Some(parent) => {
+            post_to_process(s, parent, signal::SIGCHLD);
+            CHILD_EXITED.wake_all_locked(s);
+        }
+        // Nobody will collect it. A leader already reaped (its thread ended
+        // before ours) is only waiting for that; otherwise `reap` drops it.
+        None if reaped => {
+            s.tasks.remove(&tgid);
+        }
+        None => {}
     }
-    CHILD_EXITED.wake_all_locked(&mut s);
-    schedule(&mut s);
-    unreachable!("zombie task was scheduled");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -524,12 +751,12 @@ pub enum WaitError {
 pub fn wait(pid: Pid) -> Result<ExitStatus, WaitError> {
     let mut s = SCHED.lock();
     loop {
-        let me = s.current().pid;
-        let t = s.tasks.get_mut(&pid).ok_or(WaitError::NotChild)?;
+        let me = s.current().tgid;
+        let t = s.tasks.get(&pid).ok_or(WaitError::NotChild)?;
         if t.parent != Some(me) {
             return Err(WaitError::NotChild);
         }
-        if t.state == State::Zombie {
+        if t.collectable() {
             let status = t.exit;
             collect(&mut s, pid);
             return Ok(status);
@@ -544,12 +771,8 @@ pub fn wait(pid: Pid) -> Result<ExitStatus, WaitError> {
 /// Collect any one ended child without blocking: Some((pid, status)).
 pub fn try_wait_any() -> Option<(Pid, ExitStatus)> {
     let mut s = SCHED.lock();
-    let me = s.current().pid;
-    let (pid, status) = s
-        .tasks
-        .values()
-        .find(|t| t.parent == Some(me) && t.state == State::Zombie)
-        .map(|t| (t.pid, t.exit))?;
+    let me = s.current().tgid;
+    let (pid, status) = s.tasks.values().find(|t| t.parent == Some(me) && t.collectable()).map(|t| (t.pid, t.exit))?;
     collect(&mut s, pid);
     Some((pid, status))
 }
@@ -577,19 +800,36 @@ pub enum KillTarget {
 pub fn kill(target: KillTarget, sig: u8) -> Result<(), KillError> {
     let mut s = SCHED.lock();
     let matches = |t: &Task| match target {
-        KillTarget::Process(pid) => t.pid == pid,
+        KillTarget::Process(pid) => t.tgid == pid,
         KillTarget::Group(pgid) => t.process.as_ref().map_or(false, |p| p.pgid.load(Ordering::Relaxed) == pgid),
     };
-    let victims: Vec<Pid> = s.tasks.values().filter(|t| t.state != State::Zombie && matches(t)).map(|t| t.pid).collect();
+    let mut processes: Vec<Pid> = s.tasks.values().filter(|t| t.alive() && matches(t)).map(|t| t.tgid).collect();
+    processes.sort_unstable();
+    processes.dedup();
     if let KillTarget::Process(1) = target {
         return Err(KillError::Init);
     }
     let mut sent = false;
-    for pid in victims.into_iter().filter(|&p| p != 1) {
-        post_locked(&mut s, pid, sig);
-        sent = true;
+    for tgid in processes.into_iter().filter(|&p| p != 1) {
+        sent |= post_to_process(&mut s, tgid, sig);
     }
     if sent { Ok(()) } else { Err(KillError::NotFound) }
+}
+
+/// Post `sig` to process `tgid`: to one thread that can take it now, or
+/// else the leader (or any thread) to hold it pending. False if the process
+/// has no live thread.
+fn post_to_process(s: &mut Scheduler, tgid: Pid, sig: u8) -> bool {
+    let threads = || s.threads(tgid);
+    let takes = |t: &&Task| t.signals.blocked() & signal::bit(sig) == 0;
+    let to = threads().find(takes).or_else(|| threads().find(|t| t.pid == tgid)).or_else(|| threads().next());
+    match to.map(|t| t.pid) {
+        Some(pid) => {
+            post_locked(s, pid, sig);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Post `sig` to task `pid` (if it is a live user task), waking it if it
@@ -615,7 +855,7 @@ fn post_locked(s: &mut Scheduler, pid: Pid, sig: u8) {
 /// be moved.
 pub fn set_process_group(pid: Pid, pgid: Pid) -> Result<(), KillError> {
     let mut s = SCHED.lock();
-    let me = s.current().pid;
+    let me = s.current().tgid;
     let t = s.tasks.get(&pid).filter(|t| t.state != State::Zombie).ok_or(KillError::NotFound)?;
     if pid != me && t.parent != Some(me) {
         return Err(KillError::NotFound);
@@ -630,11 +870,39 @@ pub fn with_signals<R>(f: impl FnOnce(&mut signal::Signals) -> R) -> R {
     f(&mut SCHED.lock().current().signals)
 }
 
+/// Set (if `new`) the action for `sig` in every thread of the calling
+/// process; returns the old one.
+pub fn signal_action(sig: u8, new: Option<signal::Action>) -> signal::Action {
+    let mut s = SCHED.lock();
+    let old = s.current().signals.get_action(sig);
+    if let Some(action) = new {
+        let tgid = s.current().tgid;
+        for t in s.tasks.values_mut().filter(|t| t.tgid == tgid && t.alive()) {
+            t.signals.set_action(sig, action);
+        }
+    }
+    old
+}
+
 /// On the way back to user mode: the next signal to act on, if any. A
 /// signal whose action is to end the process does so here.
 pub fn next_signal() -> Option<(u8, signal::Action, u64)> {
-    let next = with_signals(|s| s.next());
+    let (next, doomed) = {
+        let mut s = SCHED.lock();
+        let me = s.current();
+        let (next, doomed, tgid) = (me.signals.next(), me.doomed, me.tgid);
+        if let Some(signal::Disposition::Handle { sig, action, .. }) = &next {
+            if action.flags & signal::SA_RESETHAND != 0 {
+                for t in s.tasks.values_mut().filter(|t| t.tgid == tgid) {
+                    t.signals.set_action(*sig, signal::Action::default());
+                }
+            }
+        }
+        (next, doomed)
+    };
     match next? {
+        // Another thread is ending the process, or replacing its program.
+        signal::Disposition::Terminate(sig) if doomed => exit_thread(ExitStatus::Killed(sig)),
         signal::Disposition::Terminate(sig) => exit_current(ExitStatus::Killed(sig)),
         signal::Disposition::Handle { sig, action, restore_mask } => Some((sig, action, restore_mask)),
     }
@@ -690,9 +958,9 @@ fn reap(s: &mut Scheduler) {
         s.zombies.swap_remove(i);
         t.kstack = None; // back to the stack pool
         t.process = None; // the last reference: frees every page the process owned
-        let parent = t.parent;
-        let orphan = parent.map_or(true, |p| s.tasks.get(&p).map_or(true, |t| t.state == State::Zombie));
-        if orphan {
+        // A thread other than the leader, or a process nobody will wait for
+        // (whose parent has ended; see `end_process`).
+        if t.parent.is_none() && (t.pid != t.tgid || t.ended) {
             s.tasks.remove(&pid);
         }
     }
@@ -752,6 +1020,8 @@ fn schedule(s: &mut SchedGuard) {
     }
     if let Some(fpu) = next.fpu.as_ref() {
         fpu.restore();
+        // A user task's thread-local storage (kernel code doesn't use FS).
+        unsafe { cpu::wrmsr(cpu::msr::FS_BASE, next.fs_base) };
     }
     s.cpus[index].current = next_ptr;
     let (prev_rsp, next_rsp) = (&mut prev.rsp as *mut u64, next.rsp);
@@ -823,8 +1093,21 @@ pub fn uptime_ms() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// The calling process: its leader's pid (`getpid`).
 pub fn current_pid() -> Pid {
+    SCHED.lock().current().tgid
+}
+
+/// The calling thread (`gettid`).
+pub fn current_tid() -> Pid {
     SCHED.lock().current().pid
+}
+
+/// Set the calling thread's FS base (its thread-local storage pointer).
+pub fn set_fs_base(base: u64) {
+    let mut s = SCHED.lock();
+    s.current().fs_base = base;
+    unsafe { cpu::wrmsr(cpu::msr::FS_BASE, base) };
 }
 
 /// The running user process; None for kernel threads. Drop the result
@@ -843,6 +1126,7 @@ pub fn user_page_fault(addr: u64, write: bool, exec: bool) -> FaultResult {
 
 pub struct TaskInfo {
     pub pid: Pid,
+    pub tgid: Pid,
     pub parent: Option<Pid>,
     pub state: State,
     pub cpu: Option<usize>,
@@ -854,7 +1138,7 @@ pub fn list() -> Vec<TaskInfo> {
     let s = SCHED.lock();
     s.tasks
         .values()
-        .map(|t| TaskInfo { pid: t.pid, parent: t.parent, state: t.state, cpu: t.cpu, name: t.name.clone() })
+        .map(|t| TaskInfo { pid: t.pid, tgid: t.tgid, parent: t.parent, state: t.state, cpu: t.cpu, name: t.name.clone() })
         .collect()
 }
 

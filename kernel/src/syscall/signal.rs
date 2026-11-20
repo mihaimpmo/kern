@@ -204,10 +204,7 @@ pub fn sigaction(sig: u64, act: u64, old: u64) -> SysResult {
     if old != 0 {
         check_user(old, 32, true)?;
     }
-    let prev = task::with_signals(|s| match new {
-        Some(a) => s.set_action(sig, a),
-        None => s.get_action(sig),
-    });
+    let prev = task::signal_action(sig, new);
     if old != 0 {
         let mut raw = [0u8; 32];
         for (i, w) in [prev.handler, prev.flags, prev.restorer, prev.mask].iter().enumerate() {

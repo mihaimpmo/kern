@@ -1,11 +1,13 @@
-//! Process system calls: spawn, exec, wait, and process information.
+//! Process system calls: spawn, exec, threads, wait, and process
+//! information.
 
 use super::{check_user, copy_from_user, copy_out, copy_to_user, user_bytes, user_path, Errno, SysResult, SyscallFrame};
-use super::{E2BIG, ECHILD, EFAULT, EINTR, EINVAL, EPERM, ESRCH};
+use super::{E2BIG, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, ENOMEM, EPERM, ESRCH};
+use crate::mm::vmm::USER_END;
 use crate::arch::smp;
 use crate::drivers::{keyboard, rtc};
 use crate::mm::pmm;
-use crate::task::{self, exec, signal, Inherit, KillError, KillTarget, SpawnError, WaitError};
+use crate::task::{self, exec, signal, Inherit, KillError, KillTarget, SpawnError, ThreadError, WaitError};
 use core::sync::atomic::Ordering;
 use alloc::{format, string::String, vec, vec::Vec};
 use core::fmt::Write;
@@ -15,6 +17,7 @@ impl From<SpawnError> for Errno {
         match e {
             SpawnError::Fs(e) => e.into(),
             SpawnError::Load(e) => e.into(),
+            SpawnError::Interrupted => EINTR,
         }
     }
 }
@@ -82,6 +85,27 @@ pub fn exec(f: &mut SyscallFrame, path: u64, path_len: u64, argv: u64, argc: u64
     Ok(0)
 }
 
+/// A new thread in this process; see `task::spawn_thread`.
+pub fn thread_create(rip: u64, rsp: u64, arg: u64, tls: u64, exit_word: u64) -> SysResult {
+    // Entering user mode at a non-canonical address would fault in ring 0.
+    if rip >= USER_END || rsp >= USER_END || tls >= USER_END || exit_word % 4 != 0 {
+        return Err(EINVAL);
+    }
+    task::spawn_thread(rip, rsp, arg, tls, exit_word).map_err(|e| match e {
+        ThreadError::NoMemory => ENOMEM,
+        ThreadError::Exiting => EAGAIN,
+    })
+}
+
+/// Point FS at this thread's thread-local storage.
+pub fn set_fs_base(addr: u64) -> SysResult {
+    if addr >= USER_END {
+        return Err(EINVAL);
+    }
+    task::set_fs_base(addr);
+    Ok(0)
+}
+
 pub fn wait(pid: u64, code_ptr: u64) -> SysResult {
     // Check first: once the child is collected its exit code can't be put back.
     check_user(code_ptr, 8, true)?;
@@ -130,7 +154,12 @@ pub fn ps(buf: u64, len: u64) -> SysResult {
     let mut text = String::new();
     let _ = writeln!(text, "  PID  PPID  STATE     CPU  NAME");
     for t in task::list() {
-        let ppid = t.parent.map_or(String::from("-"), |p| format!("{}", p));
+        // A thread other than the first shows its process instead.
+        let ppid = match t.parent {
+            _ if t.tgid != t.pid => format!("t{}", t.tgid),
+            Some(p) => format!("{}", p),
+            None => String::from("-"),
+        };
         let cpu = t.cpu.map_or(String::from("-"), |c| format!("{}", c));
         let state = format!("{:?}", t.state);
         let _ = writeln!(text, "{:>5} {:>5}  {:<9} {:>3}  {}", t.pid, ppid, state, cpu, t.name);

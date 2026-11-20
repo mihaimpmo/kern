@@ -45,7 +45,8 @@ kern:/> ls /bin | wc -l
 | Files | VFS with an in-memory root (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection, rename |
 | Storage | PCI enumeration, NVMe driver, write-through block cache; **KFS**, Kern's own on-disk filesystem, mounted at `/disk` |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
-| Syscalls | 40: processes (spawn with argv, exec, wait, kill, process groups), signals (sigaction, sigprocmask, sigsuspend), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, rename, chdir, dup2, pipe, statfs, ...), time |
+| Syscalls | 44: processes (spawn with argv, exec, wait, kill, process groups), threads, signals (sigaction, sigprocmask, sigsuspend), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, rename, chdir, dup2, pipe, statfs, ...), time |
+| Threads | Several threads per process sharing memory, files and handlers, run in parallel on all CPUs; per-thread FS base for thread-local storage; `exit` ends every thread; munmap/mprotect shoot down stale TLB entries on CPUs running the other threads. `ulib::thread::spawn`/`join` and `ulib::sync::Mutex` |
 | Signals | Handlers on the user stack (Linux-style `sigaction`, `sigreturn`), blocking masks, `sigsuspend`, SIGCHLD; `kill`, process groups, Ctrl+C interrupts the foreground job; CPU faults raise SIGSEGV/SIGILL/SIGFPE, which a handler can catch |
 | Pipes | 64 KiB pipes with EOF and EPIPE, close-on-spawn descriptors |
 | Clock | Date and time from the CMOS real-time clock |
@@ -158,7 +159,7 @@ Nothing is written to the internal disk. The kernel does drive NVMe SSDs, but it
 
 ### Suggested next steps, roughly in order
 
-1. **Threads:** `clone` into the same address space, thread-local storage (FS base), futexes, and shootdowns of user mappings; then a real libc port.
+1. **Threads, part 2:** futexes, so a thread waiting for a lock or a `join` sleeps instead of yielding in a loop; then a real libc port.
 2. **SMP, part 3:** split the scheduler lock, so the per-CPU queues stop sharing one lock.
 3. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 4. **Storage, part 2:** interrupt-driven NVMe with several commands in flight, AHCI for SATA disks, partitions (GPT), a journal for KFS, and FAT32 for exchanging files.

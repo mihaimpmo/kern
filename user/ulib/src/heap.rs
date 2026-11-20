@@ -1,12 +1,13 @@
 //! The global allocator: a linked-list heap on memory from `brk`, grown on
 //! demand (the kernel maps the pages when they are first touched).
 //!
-//! Processes are single-threaded, so the heap needs no lock; threads would
-//! need one here. When memory runs out, allocation fails and Rust's default
-//! handler panics ("memory allocation of N bytes failed").
+//! One `Mutex` guards it, shared by every thread (so a signal handler must
+//! not allocate: the code it interrupted may hold the lock). When memory
+//! runs out, allocation fails and Rust's default handler panics ("memory
+//! allocation of N bytes failed").
 
+use crate::sync::Mutex;
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr::{null_mut, NonNull};
 use linked_list_allocator::Heap;
 
@@ -19,13 +20,10 @@ struct State {
     top: usize,
 }
 
-pub struct UserHeap(UnsafeCell<State>);
-
-// Single-threaded process: see the module comment.
-unsafe impl Sync for UserHeap {}
+pub struct UserHeap(Mutex<State>);
 
 #[global_allocator]
-static HEAP: UserHeap = UserHeap(UnsafeCell::new(State { heap: Heap::empty(), top: 0 }));
+static HEAP: UserHeap = UserHeap(Mutex::new(State { heap: Heap::empty(), top: 0 }));
 
 impl State {
     /// Ask the kernel for at least `at_least` more bytes after `top`.
@@ -50,7 +48,7 @@ impl State {
 
 unsafe impl GlobalAlloc for UserHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let st = &mut *self.0.get();
+        let mut st = self.0.lock();
         if let Ok(p) = st.heap.allocate_first_fit(layout) {
             return p.as_ptr();
         }
@@ -64,6 +62,6 @@ unsafe impl GlobalAlloc for UserHeap {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        (*self.0.get()).heap.deallocate(NonNull::new_unchecked(ptr), layout);
+        self.0.lock().heap.deallocate(NonNull::new_unchecked(ptr), layout);
     }
 }

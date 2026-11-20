@@ -42,6 +42,16 @@
 //! Programs (process.rs):
 //!   36 exec(path, len, argv, argc)       replaces the program; no return
 //!
+//! Threads (process.rs). A process is known by its first thread's id:
+//!    0 exit(code)                         ends the process, every thread
+//!    3 getpid()                           the process
+//!   41 thread_create(rip, rsp, arg, tls, exit_word: *mut u32) -> tid
+//!        a new thread at rip, stack rsp, rdi = arg, FS base = tls; when
+//!        it ends, *exit_word is set to 0 (if exit_word isn't 0)
+//!   42 thread_exit(code)                  ends this thread; the process ends
+//!                                         with its last thread
+//!   43 gettid()                           44 set_fs_base(addr)
+//!
 //! Exit statuses (wait, try_wait) are the exit code in the low 32 bits, or
 //! 1 << 32 | signal for a process that was killed. CPU faults in user mode
 //! raise SIGSEGV, SIGILL, SIGFPE, ...; see `task::signal` for what signals do.
@@ -83,6 +93,7 @@ pub const E2BIG: Errno = Errno(7);
 pub const ENOEXEC: Errno = Errno(8);
 pub const EBADF: Errno = Errno(9);
 pub const ECHILD: Errno = Errno(10);
+pub const EAGAIN: Errno = Errno(11);
 pub const ENOMEM: Errno = Errno(12);
 pub const EFAULT: Errno = Errno(14);
 pub const EEXIST: Errno = Errno(17);
@@ -281,7 +292,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) -> bool {
 }
 
 fn call(f: &mut SyscallFrame) -> SysResult {
-    let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
+    let (a0, a1, a2, a3, a4) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8);
     match f.rax {
         0 => task::exit_current(ExitStatus::Exited(a0 as i32)),
         1 => file::write(a0, a1, a2),
@@ -328,6 +339,10 @@ fn call(f: &mut SyscallFrame) -> SysResult {
         37 => signal::sigaction(a0, a1, a2),
         38 => signal::sigprocmask(a0, a1, a2),
         40 => signal::sigsuspend(a0),
+        41 => process::thread_create(a0, a1, a2, a3, a4),
+        42 => task::exit_thread(ExitStatus::Exited(a0 as i32)),
+        43 => Ok(task::current_tid()),
+        44 => process::set_fs_base(a0),
         _ => Err(ENOSYS),
     }
 }
@@ -380,6 +395,14 @@ fn copy_to_user(dst: u64, data: &[u8]) -> Result<(), Errno> {
         cpu::user_access_end();
         Ok(())
     })?
+}
+
+/// Store a u32 in user memory (for the kernel's own use, not a syscall).
+pub fn put_user_u32(dst: u64, value: u32) -> Result<(), Errno> {
+    if dst % 4 != 0 {
+        return Err(EINVAL);
+    }
+    copy_to_user(dst, &value.to_le_bytes())
 }
 
 /// Copy as much of `data` as fits in the user buffer; returns bytes copied.
