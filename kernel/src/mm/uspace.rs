@@ -12,12 +12,19 @@
 //! touch (a page fault, or kernel access through `populate`), so reserving
 //! address space costs nothing.
 //!
-//! TLB: a process's page tables are only loaded on the CPU running it, so
-//! changes are flushed from this CPU only. (Threads would break this.)
+//! TLB: the threads of a process may be running on several CPUs at once, so
+//! a change to a mapping must be flushed from all of them (`tlb::shootdown_
+//! user`), and a frame that was unmapped can only be freed after that. The
+//! shootdown can't be done here, under the address-space lock (another CPU
+//! may be spinning on it with interrupts off), so changes are collected in
+//! `pending` and whoever made them calls `take_flush` and `Flush::finish`
+//! once the lock is released. Until then the old frames stay allocated, so
+//! a stale entry elsewhere can only reach this process's own old data.
 
 use super::vmm::{self, AddressSpace};
 use super::{align_down, align_up, pmm, PAGE_SIZE};
-use alloc::collections::BTreeMap;
+use crate::arch::tlb;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 pub const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 pub const STACK_SIZE: u64 = 8 << 20;
@@ -92,17 +99,77 @@ struct Region {
     prot: Prot,
 }
 
+/// Mapping changes still to be flushed from other CPUs, and the frames
+/// unmapped by them, to free afterwards (see the module note).
+#[must_use = "the changes must be flushed with `finish`"]
+pub struct Flush {
+    pml4: u64,
+    start: u64,
+    end: u64,
+    frames: Vec<u64>,
+}
+
+impl Flush {
+    /// Flush the changed range from every CPU, then free the frames. Call
+    /// with interrupts on and no `SpinLock` held.
+    pub fn finish(self) {
+        tlb::shootdown_user(self.pml4, self.start, self.end);
+        for &frame in &self.frames {
+            pmm::free_frame(frame);
+        }
+    }
+}
+
 pub struct UserSpace {
     pt: AddressSpace,
     /// start -> region. Page-aligned, non-empty, non-overlapping.
     regions: BTreeMap<u64, Region>,
     heap_start: u64,
     brk: u64,
+    pending: Option<Flush>,
+}
+
+impl Drop for UserSpace {
+    fn drop(&mut self) {
+        // Nothing has these page tables loaded any more.
+        if let Some(flush) = self.pending.take() {
+            for frame in flush.frames {
+                pmm::free_frame(frame);
+            }
+        }
+    }
 }
 
 impl UserSpace {
     pub fn new() -> Option<Self> {
-        Some(UserSpace { pt: AddressSpace::new()?, regions: BTreeMap::new(), heap_start: 0, brk: 0 })
+        Some(UserSpace { pt: AddressSpace::new()?, regions: BTreeMap::new(), heap_start: 0, brk: 0, pending: None })
+    }
+
+    /// The changes made since the last call, to finish once the lock on
+    /// this space is released.
+    pub fn take_flush(&mut self) -> Option<Flush> {
+        self.pending.take()
+    }
+
+    /// Rewrite (or clear) the mapped entries in [start, end) with `f`,
+    /// recording what changed for `take_flush`. `f` returns a frame to free
+    /// once no CPU can reach it any more.
+    fn update(&mut self, start: u64, end: u64, mut f: impl FnMut(&mut u64) -> Option<u64>) {
+        let pml4 = self.pml4();
+        let pending = self.pending.get_or_insert(Flush { pml4, start: u64::MAX, end: 0, frames: Vec::new() });
+        vmm::update_range(pml4, start, end, |virt, entry| {
+            let old = *entry;
+            if let Some(frame) = f(entry) {
+                pending.frames.push(frame);
+            }
+            if *entry != old {
+                pending.start = pending.start.min(virt);
+                pending.end = pending.end.max(virt + PAGE_SIZE);
+            }
+        });
+        if pending.start == u64::MAX && pending.frames.is_empty() {
+            self.pending = None;
+        }
     }
 
     pub fn pml4(&self) -> u64 {
@@ -169,9 +236,10 @@ impl UserSpace {
         for s in self.isolate(start, end) {
             self.regions.remove(&s);
         }
-        vmm::update_range(self.pml4(), start, end, |_, entry| {
-            pmm::free_frame(vmm::entry_frame(*entry));
+        self.update(start, end, |entry| {
+            let frame = vmm::entry_frame(*entry);
             *entry = 0;
+            Some(frame)
         });
     }
 
@@ -315,7 +383,10 @@ impl UserSpace {
             self.regions.get_mut(&s).unwrap().prot = prot;
         }
         let flags = vmm::leaf_flags(prot.page_flags());
-        vmm::update_range(self.pml4(), addr, end, |_, entry| *entry = vmm::entry_frame(*entry) | flags);
+        self.update(addr, end, |entry| {
+            *entry = vmm::entry_frame(*entry) | flags;
+            None
+        });
         Ok(())
     }
 

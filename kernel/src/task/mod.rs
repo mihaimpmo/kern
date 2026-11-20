@@ -27,7 +27,7 @@ pub mod signal;
 
 use crate::arch::fpu::FpuState;
 use crate::arch::interrupts::VECTOR_RESCHEDULE;
-use crate::arch::{apic, cpu, percpu, smp};
+use crate::arch::{apic, cpu, percpu, smp, tlb};
 use crate::fs::FdTable;
 use crate::mm::uspace::{FaultResult, UserSpace};
 use crate::mm::{kstack::KernelStack, vmm};
@@ -446,7 +446,7 @@ pub fn exec_current(path: &str, args: &[&[u8]]) -> Result<(u64, u64), SpawnError
         let mut s = SCHED.lock();
         let t = s.current();
         t.pml4 = pml4;
-        unsafe { cpu::write_cr3(pml4) };
+        tlb::switch_to(pml4);
         t.name = name;
         t.signals.reset_for_exec();
         // The live registers are the task's (the kernel never uses them).
@@ -743,7 +743,7 @@ fn schedule(s: &mut SchedGuard) {
         percpu::set_kernel_stack(stack.top());
     }
     if cpu::read_cr3() & !0xfff != next.pml4 {
-        unsafe { cpu::write_cr3(next.pml4) };
+        tlb::switch_to(next.pml4);
     }
     // The kernel never uses these registers, so swapping them here, before
     // the stack switch, is the same as doing it on the way to user mode.

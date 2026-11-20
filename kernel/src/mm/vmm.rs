@@ -130,8 +130,8 @@ pub fn unmap(pml4: u64, virt: u64) -> Option<u64> {
 /// (page-aligned, user half), skipping page tables that don't exist, so a
 /// huge sparse range costs only as much as what is mapped in it. `f` may
 /// rewrite or clear the entry; changed entries are flushed from this CPU's
-/// TLB. (Only this CPU: user page tables are loaded only on the CPU running
-/// their process.)
+/// TLB. Other CPUs running the same process need a shootdown: see
+/// `uspace::Flush`.
 pub fn update_range(pml4: u64, start: u64, end: u64, mut f: impl FnMut(u64, &mut u64)) {
     debug_assert!(start % PAGE_SIZE == 0 && end % PAGE_SIZE == 0 && end <= USER_END);
     let _lock = PT_LOCK.lock();

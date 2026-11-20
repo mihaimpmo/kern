@@ -106,7 +106,7 @@ pub fn try_wait(code_ptr: u64) -> SysResult {
 
 pub fn sysinfo(buf: u64) -> SysResult {
     let (free, total) = pmm::stats();
-    let (shootdowns, remote_flushes) = crate::arch::tlb::stats();
+    let (shootdowns, remote_flushes, user_shootdowns) = crate::arch::tlb::stats();
     let fields = [
         total,
         free,
@@ -116,8 +116,9 @@ pub fn sysinfo(buf: u64) -> SysResult {
         crate::mm::kstack::mapped(),
         shootdowns,
         remote_flushes,
+        user_shootdowns,
     ];
-    let mut out = [0u8; 64];
+    let mut out = [0u8; 72];
     for (i, v) in fields.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
